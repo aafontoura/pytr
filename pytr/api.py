@@ -22,10 +22,12 @@
 
 import asyncio
 import json
+import os
 import pathlib
 import re
 import ssl
 import subprocess
+import sys
 import time
 import urllib.parse
 import uuid
@@ -39,12 +41,29 @@ from curl_cffi import requests as cffi_requests
 from playwright.sync_api import sync_playwright
 
 from pytr.awswaf.aws import AwsWaf
+from pytr.security import (
+    assert_safe_to_read,
+    secure_dir,
+    secure_prepare_file,
+)
 from pytr.utils import get_logger
 
 home = pathlib.Path.home()
 BASE_DIR = home / ".pytr"
 CREDENTIALS_FILE = BASE_DIR / "credentials"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
+
+# P-5: bound WAF / document / login network operations so a hung or hostile
+# endpoint cannot pin a worker indefinitely.
+DEFAULT_NETWORK_TIMEOUT = 30
+
+
+class ReadOnlyError(RuntimeError):
+    """Raised when a mutation method is called on a read-only API instance (P-6)."""
+
+
+class MalformedDeltaError(ValueError):
+    """Raised on a malformed websocket delta segment so the recv loop can reconnect (P-5)."""
 
 
 class TradeRepublicApi:
@@ -75,11 +94,16 @@ class TradeRepublicApi:
         credentials_file=None,
         cookies_file=None,
         waf_token="playwright",
+        read_only=False,
     ):
         self.log = get_logger(__name__)
         self._locale = locale
         self._save_cookies = save_cookies
         self._waf_token = waf_token
+        # P-6: when True, every mutation method raises before any network I/O.
+        # This reduces accidental exposure only; the server-side TR session
+        # remains write-capable (see ADR-0006 / audit H3).
+        self._read_only = read_only
 
         self._credentials_file = pathlib.Path(credentials_file) if credentials_file else CREDENTIALS_FILE
 
@@ -100,8 +124,17 @@ class TradeRepublicApi:
         self._websession = requests.Session()
         self._websession.headers = self._default_headers
         if self._save_cookies:
+            # P-1: ensure the cookie jar's directory (0700) and file (0600)
+            # exist with safe perms before MozillaCookieJar touches them.
+            secure_dir(BASE_DIR)
+            secure_prepare_file(self._cookies_file)
             self._websession.cookies = MozillaCookieJar(self._cookies_file)
         self._sec_acc_no: str | None = None
+
+    def _guard_read_only(self) -> None:
+        """P-6: block mutations on read-only instances before any network I/O."""
+        if getattr(self, "_read_only", False):
+            raise ReadOnlyError("This TradeRepublicApi instance is read-only; mutation methods are disabled.")
 
     def _fetch_waf_token_awswaf(self):
         """
@@ -111,14 +144,15 @@ class TradeRepublicApi:
         self.log.info("Retrieving AWS WAF token using awswaf...")
         try:
             session = cffi_requests.Session(impersonate="chrome")
-            response = session.get(self._waf_login_url)
+            # P-5: bound WAF network operations with explicit timeouts.
+            response = session.get(self._waf_login_url, timeout=DEFAULT_NETWORK_TIMEOUT)
             m = re.search(r'src="(https://[^"]+/challenge\.js)"', response.text)
             if not m:
                 self.log.warning("AWS WAF token not acquired. challenge.js URL not found in login page.")
                 return None
             challenge_js_url = m.group(1)
             waf_endpoint = challenge_js_url.split("https://", 1)[1].rsplit("/challenge.js", 1)[0]
-            challenge_js = session.get(challenge_js_url).text
+            challenge_js = session.get(challenge_js_url, timeout=DEFAULT_NETWORK_TIMEOUT).text
             token = AwsWaf(waf_endpoint, "app.traderepublic.com", challenge_js)()
         except Exception:
             self.log.error("Failed to get AWS WAF token.")
@@ -138,13 +172,21 @@ class TradeRepublicApi:
 
         self.log.info("Retrieving AWS WAF token using Playwright...")
 
+        # P-3: keep Chromium's sandbox ON by default. Disabling it is only
+        # allowed via an explicit opt-in env var (e.g. for constrained CI),
+        # never silently.
+        launch_args: list[str] = []
+        if os.environ.get("PYTR_ALLOW_NO_SANDBOX") == "1":
+            self.log.warning("PYTR_ALLOW_NO_SANDBOX=1 set; launching Chromium WITHOUT its sandbox.")
+            launch_args = ["--no-sandbox", "--disable-setuid-sandbox"]
+
         called_playwright_install = False
         while True:
             try:
                 with sync_playwright() as p:
                     browser = p.chromium.launch(
                         headless=True,
-                        args=["--no-sandbox", "--disable-setuid-sandbox"],
+                        args=launch_args,
                     )
                     context = browser.new_context()
                     page = context.new_page()
@@ -174,7 +216,9 @@ class TradeRepublicApi:
                     self.log.info('Running "playwright install chromium"...')
                     called_playwright_install = True
                     done = False
-                    subprocess.run(["playwright", "install", "chromium"], check=True)
+                    # P-3: invoke playwright via the current interpreter, never a
+                    # PATH-resolved binary.
+                    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
                     self.log.info("Calling Playwright once more...")
             if done:
                 break
@@ -216,7 +260,8 @@ class TradeRepublicApi:
             self.log.info("Using WAF token from arguments.")
 
         if self._waf_token:
-            self.log.debug(f"WAF Token: {self._waf_token}")
+            # P-4: never log the WAF token value.
+            self.log.debug("WAF token acquired.")
             self._set_waf_cookie(self._waf_token)
         else:
             self.log.warning("No WAF token available.")
@@ -224,11 +269,13 @@ class TradeRepublicApi:
         r = self._websession.post(
             f"{self._host}/api/v1/auth/web/login",
             json={"phoneNumber": self.phone_no, "pin": self.pin},
+            timeout=DEFAULT_NETWORK_TIMEOUT,
         )
         self.log.debug(f"Web login returned: {r.status_code}")
         r.raise_for_status()
         j = r.json()
-        self.log.debug(f"Web login data: {json.dumps(j, indent=4)}")
+        # P-4: never log the raw login response (contains processId + PII).
+        self.log.debug("Web login response received.")
         try:
             self._process_id = j["processId"]
         except KeyError:
@@ -256,8 +303,11 @@ class TradeRepublicApi:
 
     def save_websession(self):
         if self._save_cookies:
+            # P-1: (re)assert 0600 perms around the plaintext jar write.
+            secure_prepare_file(self._cookies_file)
             # Saves session cookies too (expirydate=0).
             self._websession.cookies.save(ignore_discard=True)
+            secure_prepare_file(self._cookies_file)
 
     def resume_websession(self):
         """
@@ -272,8 +322,19 @@ class TradeRepublicApi:
 
         self.log.info("Trying to resume websession...")
 
+        # P-1: fail closed if the jar is a symlink or group/other-readable.
+        try:
+            assert_safe_to_read(self._cookies_file)
+        except OSError:
+            return False
+
         # Loads session cookies too (expirydate=0).
-        self._websession.cookies.load(ignore_discard=True)
+        # P-5/L3: guard the disk-resume path against races / OS errors.
+        try:
+            self._websession.cookies.load(ignore_discard=True)
+        except (FileNotFoundError, OSError):
+            self.log.info("Cookie file unavailable; starting fresh session.")
+            return False
 
         try:
             self.log.debug("Calling settings...")
@@ -308,7 +369,9 @@ class TradeRepublicApi:
         # authenticate with cookies, set different connection message and connect ID
         cookie_str = ""
         for cookie in self._websession.cookies:
-            if cookie.domain.endswith("traderepublic.com"):
+            # P-5/L2: exact-or-subdomain match so "evil-traderepublic.com" is
+            # not treated as a TR cookie.
+            if cookie.domain == "traderepublic.com" or cookie.domain.endswith(".traderepublic.com"):
                 cookie_str += f"{cookie.name}={cookie.value}; "
         extra_headers = {"Cookie": cookie_str.rstrip("; ")}
 
@@ -350,7 +413,8 @@ class TradeRepublicApi:
     async def subscribe(self, payload):
         subscription_id = await self._next_subscription_id()
         ws = await self._get_ws()
-        self.log.debug(f"Subscribing: 'sub {subscription_id} {json.dumps(payload)}'")
+        # P-4: log only the subscription type, not the full payload.
+        self.log.debug(f"Subscribing id={subscription_id} type={payload.get('type', '?') if isinstance(payload, dict) else '?'}")
         self.subscriptions[subscription_id] = payload
         await ws.send(f"sub {subscription_id} {json.dumps(payload)}")
         return subscription_id
@@ -368,7 +432,8 @@ class TradeRepublicApi:
         ws = await self._get_ws()
         while True:
             response = await ws.recv()
-            self.log.debug(f"Received message: {response!r}")
+            # P-4: do not log raw websocket messages (financial payloads).
+            self.log.debug("Received websocket message (%d bytes).", len(response))
 
             subscription_id = response[: response.find(" ")]
             code = response[response.find(" ") + 1 : response.find(" ") + 2]
@@ -387,7 +452,8 @@ class TradeRepublicApi:
 
             elif code == "D":
                 response = self._calculate_delta(subscription_id, payload_str)
-                self.log.debug(f"Payload is {response}")
+                # P-4: do not log the reconstructed financial payload.
+                self.log.debug("Reconstructed delta payload (%d bytes).", len(response))
 
                 self._previous_responses[subscription_id] = response
                 return subscription_id, subscription, json.loads(response)
@@ -409,13 +475,21 @@ class TradeRepublicApi:
         previous_response = self._previous_responses[subscription_id]
         i, result = 0, []
         for diff in delta_payload.split("\t"):
+            # P-5/L1: a malformed segment (empty, or non-numeric length) from a
+            # hostile/buggy backend must not crash the recv loop.
+            if not diff:
+                continue
             sign = diff[0]
             if sign == "+":
                 result.append(urllib.parse.unquote_plus(diff).strip())
             elif sign == "-" or sign == "=":
+                try:
+                    length = int(diff[1:])
+                except ValueError as e:
+                    raise MalformedDeltaError(f"Malformed delta segment: {diff!r}") from e
                 if sign == "=":
-                    result.append(previous_response[i : i + int(diff[1:])])
-                i += int(diff[1:])
+                    result.append(previous_response[i : i + length])
+                i += length
         return "".join(result)
 
     async def _recv_subscription(self, subscription_id):
@@ -470,9 +544,11 @@ class TradeRepublicApi:
         return await self.subscribe({"type": "stockDetails", "id": isin})
 
     async def add_watchlist(self, isin):
+        self._guard_read_only()
         return await self.subscribe({"type": "addToWatchlist", "instrumentId": isin})
 
     async def remove_watchlist(self, isin):
+        self._guard_read_only()
         return await self.subscribe({"type": "removeFromWatchlist", "instrumentId": isin})
 
     async def ticker(self, isin, exchange="LSX"):
@@ -606,6 +682,7 @@ class TradeRepublicApi:
         expiry_date=None,
         warnings_shown=None,
     ):
+        self._guard_read_only()
         parameters = {
             "type": "simpleCreateOrder",
             "clientProcessId": str(uuid.uuid4()),
@@ -636,6 +713,7 @@ class TradeRepublicApi:
         expiry_date=None,
         warnings_shown=None,
     ):
+        self._guard_read_only()
         parameters = {
             "type": "simpleCreateOrder",
             "clientProcessId": str(uuid.uuid4()),
@@ -666,6 +744,7 @@ class TradeRepublicApi:
         expiry_date=None,
         warnings_shown=None,
     ):
+        self._guard_read_only()
         parameters = {
             "type": "simpleCreateOrder",
             "clientProcessId": str(uuid.uuid4()),
@@ -686,6 +765,7 @@ class TradeRepublicApi:
         return await self.subscribe(parameters)
 
     async def cancel_order(self, order_id):
+        self._guard_read_only()
         return await self.subscribe({"type": "cancelOrder", "orderId": order_id})
 
     async def savings_plan_overview(self):
@@ -704,6 +784,7 @@ class TradeRepublicApi:
         start_date_value,
         warnings_shown=None,
     ):
+        self._guard_read_only()
         parameters = {
             "type": "createSavingsPlan",
             "warningsShown": warnings_shown if warnings_shown else [],
@@ -731,6 +812,7 @@ class TradeRepublicApi:
         start_date_value,
         warnings_shown=None,
     ):
+        self._guard_read_only()
         parameters = {
             "id": savings_plan_id,
             "type": "changeSavingsPlan",
@@ -749,15 +831,18 @@ class TradeRepublicApi:
         return await self.subscribe(parameters)
 
     async def cancel_savings_plan(self, savings_plan_id):
+        self._guard_read_only()
         return await self.subscribe({"type": "cancelSavingsPlan", "id": savings_plan_id})
 
     async def price_alarm_overview(self):
         return await self.subscribe({"type": "priceAlarms"})
 
     async def create_price_alarm(self, isin, price):
+        self._guard_read_only()
         return await self.subscribe({"type": "createPriceAlarm", "instrumentId": isin, "targetPrice": price})
 
     async def cancel_price_alarm(self, price_alarm_id):
+        self._guard_read_only()
         return await self.subscribe({"type": "cancelPriceAlarm", "id": price_alarm_id})
 
     async def news(self, isin):
@@ -767,29 +852,36 @@ class TradeRepublicApi:
         return await self.subscribe({"type": "newsSubscriptions"})
 
     async def subscribe_news(self, isin):
+        self._guard_read_only()
         return await self.subscribe({"type": "subscribeNews", "instrumentId": isin})
 
     async def unsubscribe_news(self, isin):
+        self._guard_read_only()
         return await self.subscribe({"type": "unsubscribeNews", "instrumentId": isin})
 
     def payout(self, amount):
+        self._guard_read_only()
         return requests.request(
             method="POST",
             url=f"{self._host}/api/v1/payout",
             data={"amount": amount},
             headers=self._default_headers,
+            timeout=DEFAULT_NETWORK_TIMEOUT,
         ).json()
 
     def confirm_payout(self, process_id, code):
+        self._guard_read_only()
         r = requests.request(
             method="POST",
             url=f"{self._host}/api/v1/payout/{process_id}/code",
             data={"code": code},
             headers=self._default_headers,
+            timeout=DEFAULT_NETWORK_TIMEOUT,
         )
 
         if r.status_code != 200:
-            raise ValueError(f"Payout failed with response {r.text!r}")
+            # P-4/H3: do not echo the raw server error body.
+            raise ValueError(f"Payout failed with status {r.status_code}")
 
     def settings(self):
         r = self._web_request("/api/v2/auth/account")
