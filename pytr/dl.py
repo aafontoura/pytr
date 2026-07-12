@@ -4,6 +4,7 @@ from concurrent.futures import Future, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal
+from urllib.parse import urljoin, urlparse
 
 from pathvalidate import sanitize_filepath
 from requests import Response
@@ -13,6 +14,42 @@ from .event import Event
 from .timeline import Timeline
 from .transactions import TransactionExporter
 from .utils import get_logger
+
+_TR_API_HOST = "api.traderepublic.com"
+# P-5: bound document downloads so a hung endpoint cannot pin a worker.
+DOC_DOWNLOAD_TIMEOUT = 60
+
+
+class PathTraversalError(RuntimeError):
+    """Raised when a document path would escape the configured output directory (P-2)."""
+
+
+class UnexpectedDocumentHostError(RuntimeError):
+    """Raised when a document URL does not resolve to the TR API host (P-2)."""
+
+
+def _sanitize_component(value: str) -> str:
+    """Neutralise path separators and traversal components in a single path segment.
+
+    Applied to metadata-derived name fragments (doc title/id) BEFORE they are
+    joined onto the output path. The final containment check in
+    :meth:`DL._ensure_contained` is the authoritative guard.
+    """
+    value = value.replace("/", "-").replace("\\", "-").replace("\x00", "")
+    # Collapse any pure-dot component (".", "..") that could climb directories.
+    stripped = value.strip()
+    if stripped in {".", ".."}:
+        return "_"
+    return value
+
+
+def _build_document_url(payload_path: str) -> str:
+    """Build a document URL from a server-supplied path, pinned to the TR host (P-2/L5)."""
+    url = urljoin("https://api.traderepublic.com/", payload_path)
+    netloc = urlparse(url).netloc
+    if netloc != _TR_API_HOST:
+        raise UnexpectedDocumentHostError(f"Refusing document URL with unexpected host: {netloc!r}")
+    return url
 
 event_subfolder_mapping = {
     "OUTGOING_TRANSFER_DELEGATION": "Auszahlungen",
@@ -309,13 +346,22 @@ class DL:
         else:
             self.events_without_docs.append(event)
 
+    def _ensure_contained(self, filepath: Path) -> Path:
+        """Reject any path that resolves outside the output directory (P-2)."""
+        output_root = self.output_path.resolve()
+        resolved = Path(filepath).resolve()
+        if not resolved.is_relative_to(output_root):
+            raise PathTraversalError(f"Refusing to write outside output directory: {resolved} not under {output_root}")
+        return filepath
+
     def dl_doc(self, doc, titleText, subfolder, doc_date):
         """
         send asynchronous request, append future with filepath to self.futures
         """
         doc_url = doc["action"]["payload"]
         if isinstance(doc_url, dict):
-            doc_url = f"https://api.traderepublic.com/{doc_url['path']}"
+            # P-2/L5: urljoin + netloc pin instead of raw string concatenation.
+            doc_url = _build_document_url(doc_url["path"])
 
         if self.flat:
             doc_url_base = doc_url.split("?")[0]
@@ -326,7 +372,8 @@ class DL:
             if subtitleText is None:
                 subtitleText = ""
 
-            doc_id = doc["id"]
+            # P-2: sanitize the id (used in collision filenames) before any join.
+            doc_id = _sanitize_component(doc["id"])
             iso_date = doc_date.strftime("%Y-%m-%d")
             time = doc_date.strftime("%H:%M")
 
@@ -336,7 +383,8 @@ class DL:
                 directory = self.output_path
 
             # If doc_type is something like 'Kosteninformation 2', then strip the 2 and save it in doc_type_num
-            doc_type = doc["title"].rsplit(" ")
+            # P-2: sanitize the title before it becomes a directory component.
+            doc_type = _sanitize_component(doc["title"]).rsplit(" ")
             if doc_type[-1].isnumeric() is True:
                 doc_type_num = doc_type.pop()
             else:
@@ -382,6 +430,10 @@ class DL:
                 else:
                     filepath = filepath_with_doc_id
 
+        # P-2: authoritative containment check — the resolved path MUST stay
+        # strictly under the resolved output directory, or we refuse the write.
+        filepath = self._ensure_contained(filepath)
+
         doc["local_filepath"] = str(filepath)
         self.filepaths.append(str(filepath))
 
@@ -396,7 +448,8 @@ class DL:
             else:
                 self.doc_urls.append(doc_url_base)
 
-            future = self.session.get(doc_url)
+            # P-5: bound the document download with an explicit timeout.
+            future = self.session.get(doc_url, timeout=DOC_DOWNLOAD_TIMEOUT)
             future.filepath = filepath  # type: ignore[attr-defined]
             future.doc_url_base = doc_url_base  # type: ignore[attr-defined]
             self.futures.append(future)  # type: ignore[arg-type]
@@ -424,6 +477,13 @@ class DL:
                     self.log.fatal(str(e))
                     continue
 
+                # P-5: only persist successful responses; never save an error body as a PDF.
+                if getattr(r, "status_code", 200) != 200:
+                    self.log.error("Document download failed with status %s; skipping.", r.status_code)
+                    continue
+
+                # P-2: re-check containment immediately before opening the file.
+                self._ensure_contained(future.filepath)  # type: ignore[attr-defined]
                 future.filepath.parent.mkdir(parents=True, exist_ok=True)  # type: ignore[attr-defined]
                 with open(future.filepath, "wb") as f:  # type: ignore[attr-defined]
                     f.write(r.content)
