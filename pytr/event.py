@@ -495,7 +495,8 @@ class Event:
             and not ignoreEvent
         ):
             get_event_logger().warning(f'Ignoring unknown event "{eventdesc}"')
-            get_event_logger().debug("Unknown event %s: %s", eventdesc, json.dumps(event_dict, indent=4))
+            # P-4: log the event descriptor only, never the full payload.
+            get_event_logger().debug("Unknown event %s", eventdesc)
 
         if event_type is None:
             return cls(event_type, date, title, isin, isin2, shares, shares2, value, fees, taxes, note)
@@ -521,7 +522,8 @@ class Event:
             "Wertlos",
         ]:
             get_event_logger().warning("Could not parse fees from %s", eventdesc)
-            get_event_logger().debug("Failed to parse fees from %s", json.dumps(event_dict, indent=4))
+            # P-4: descriptor only, never the full payload.
+            get_event_logger().debug("Failed to parse fees from %s", eventdesc)
 
         # parse taxes
         if taxes_dict:
@@ -735,7 +737,8 @@ class Event:
             and event_type not in [PPEventType.DIVIDEND, PPEventType.TAXES]
         ):
             get_event_logger().warning("Could not parse shares from %s", eventdesc)
-            get_event_logger().debug("Failed to parse shares from: %s", json.dumps(event_dict, indent=4))
+            # P-4: descriptor only, never the full payload.
+            get_event_logger().debug("Failed to parse shares from: %s", eventdesc)
             if eventTypeStr == "ACQUISITION_TRADE_PERK" or title == "Aktien-Bonus":
                 value = 0
                 shares = 0

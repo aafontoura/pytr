@@ -221,7 +221,8 @@ class Timeline:
                     f"{self.received_detail + self.skipped_detail:>{self.detail_digits}}/{self.all_detail}: "
                     + f"{event['title']} -- {event['subtitle']} - {event['timestamp'][:19]} {msg}"
                 )
-                self.log.debug("%s: %s", msg, json.dumps(event, indent=2))
+                # P-4: do not dump the full financial event payload.
+                self.log.debug("%s (event id=%s)", msg, event.get("id", "?"))
 
             if self.requested_detail % MAX_EVENT_REQUEST_BATCH == 0 and (
                 (self.received_detail + self.skipped_detail) < self.requested_detail

@@ -6,6 +6,7 @@ from getpass import getpass
 from pygments import formatters, highlight, lexers
 
 from .api import BASE_DIR, CREDENTIALS_FILE, TradeRepublicApi
+from .security import secure_dir, secure_write_text
 from .utils import get_logger
 
 
@@ -35,7 +36,7 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
         pin_masked = len(pin) * "*"
         log.info(f"Using credentials from file {CREDENTIALS_FILE}. Phone: {phone_no_masked}, PIN: {pin_masked}")
     else:
-        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        secure_dir(BASE_DIR)
         if phone_no is None:
             print("Please enter your TradeRepublic phone number in the format +4912345678:")
             phone_no = input()
@@ -45,8 +46,8 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
             pin = getpass(prompt="Pin (Input is hidden):")
 
         if store_credentials:
-            with open(CREDENTIALS_FILE, "w") as f:
-                f.writelines([phone_no + "\n", pin + "\n"])
+            # P-1: write credentials with 0600 perms, failing closed on symlinks.
+            secure_write_text(CREDENTIALS_FILE, f"{phone_no}\n{pin}\n")
 
             log.info(f"Storing credentials/cookies in {BASE_DIR}")
         else:
@@ -79,5 +80,6 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
         tr.complete_weblogin(code)
         log.info("Logged in.")
 
-    log.debug(get_settings(tr))
+    # P-4: never dump full account settings (PII / financial data) to logs.
+    log.debug("Account settings retrieved.")
     return tr
