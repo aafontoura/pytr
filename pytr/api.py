@@ -107,6 +107,13 @@ class TradeRepublicApi:
 
         self._credentials_file = pathlib.Path(credentials_file) if credentials_file else CREDENTIALS_FILE
 
+        # P-7: the PIN is consumed exactly once (by the login POST in
+        # initiate_weblogin) and the reference is released right after. It is
+        # therefore Optional for the whole life of the object after login.
+        # NOTE: releasing the reference ends *our* retention; CPython cannot
+        # securely erase an immutable str, so the value may still live in freed
+        # heap, swap, or a core dump until the process exits.
+        self.pin: str | None
         if not (phone_no and pin):
             try:
                 with open(self._credentials_file, "r") as f:
@@ -250,6 +257,18 @@ class TradeRepublicApi:
         self._websession.cookies.set_cookie(cookie)
 
     def initiate_weblogin(self):
+        # P-7: the PIN is single-use. It is released as soon as the login POST
+        # has been attempted, so a second initiate_weblogin() on the same client
+        # has nothing to send and must fail loudly rather than POST a null pin.
+        # Re-login requires a NEW client constructed with the PIN again.
+        # (resend_weblogin / complete_weblogin / resume_websession never need
+        # the PIN — they work off _process_id and the web session cookies.)
+        if self.pin is None:
+            raise ValueError(
+                "PIN already consumed: this TradeRepublicApi client can initiate a web login "
+                "only once. Construct a new client with phone_no and pin to log in again."
+            )
+
         self.log.info("Initiating web login...")
 
         if self._waf_token == "awswaf":
@@ -266,11 +285,20 @@ class TradeRepublicApi:
         else:
             self.log.warning("No WAF token available.")
 
-        r = self._websession.post(
-            f"{self._host}/api/v1/auth/web/login",
-            json={"phoneNumber": self.phone_no, "pin": self.pin},
-            timeout=DEFAULT_NETWORK_TIMEOUT,
-        )
+        try:
+            r = self._websession.post(
+                f"{self._host}/api/v1/auth/web/login",
+                json={"phoneNumber": self.phone_no, "pin": self.pin},
+                timeout=DEFAULT_NETWORK_TIMEOUT,
+            )
+        finally:
+            # P-7: release the PIN reference as soon as the POST has been
+            # attempted — including on a network error, where the PIN may
+            # already be on the wire. Retaining it would only widen the window;
+            # a retry must build a new client. This does NOT securely erase the
+            # string from memory (see __init__).
+            self.pin = None
+
         self.log.debug(f"Web login returned: {r.status_code}")
         r.raise_for_status()
         j = r.json()
