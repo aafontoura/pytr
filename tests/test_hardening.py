@@ -6,6 +6,8 @@ These cover the Denkeeper hardening spec acceptance criteria, notably:
 """
 
 import asyncio
+import base64
+import json
 import os
 import stat
 from pathlib import Path
@@ -14,6 +16,8 @@ import pytest
 from pathvalidate import sanitize_filepath
 
 from pytr.api import (
+    DEFAULT_NETWORK_TIMEOUT,
+    TR_WEB_APP_VERSION,
     MalformedDeltaError,
     ReadOnlyError,
     TradeRepublicApi,
@@ -158,9 +162,7 @@ def test_patch_contains_docid_traversal_payload(tmp_path):
     from datetime import datetime
 
     # Force the collision path branch so the doc id enters the filename.
-    dl.filepaths.append(
-        str(sanitize_filepath(output / "Abschlüsse" / "20240101" / "Kontoauszug.pdf", "_", "auto"))
-    )
+    dl.filepaths.append(str(sanitize_filepath(output / "Abschlüsse" / "20240101" / "Kontoauszug.pdf", "_", "auto")))
     dl.dl_doc(doc, "Kontoauszug", None, datetime(2024, 1, 1, 9, 0))
     for p in dl.filepaths:
         assert Path(p).resolve().is_relative_to(output.resolve())
@@ -315,7 +317,7 @@ def test_pin_is_sent_once_then_released(tmp_path):
     """AC-P7.1: the login POST carries the PIN, and the reference is dropped after."""
     sent = []
 
-    def post(url, json=None, timeout=None):
+    def post(url, json=None, timeout=None, headers=None):
         sent.append(json)
         return _FakeLoginResponse()
 
@@ -332,7 +334,7 @@ def test_pin_is_sent_once_then_released(tmp_path):
 def test_pin_released_even_when_login_post_raises():
     """A network failure must not leave the PIN resident on the client."""
 
-    def post(url, json=None, timeout=None):
+    def post(url, json=None, timeout=None, headers=None):
         raise ConnectionError("network down")
 
     tr = _login_api(post)
@@ -343,7 +345,7 @@ def test_pin_released_even_when_login_post_raises():
 
 def test_no_attribute_retains_the_pin_after_login():
     """After login, no attribute of the client object holds the PIN value."""
-    tr = _login_api(lambda url, json=None, timeout=None: _FakeLoginResponse())
+    tr = _login_api(lambda url, json=None, timeout=None, headers=None: _FakeLoginResponse())
     tr.initiate_weblogin()
 
     leaks = [name for name, value in vars(tr).items() if value == PIN]
@@ -354,7 +356,7 @@ def test_second_initiate_weblogin_without_pin_raises():
     """Re-login on a consumed client fails loudly instead of POSTing a null pin."""
     calls = []
 
-    def post(url, json=None, timeout=None):
+    def post(url, json=None, timeout=None, headers=None):
         calls.append(json)
         return _FakeLoginResponse()
 
@@ -384,3 +386,401 @@ def test_resend_and_complete_weblogin_do_not_need_the_pin():
     tr.complete_weblogin("123456")  # must not raise
     assert any("/resend" in u for u in posted)
     assert any(u.endswith("/123456") for u in posted)
+
+
+# --------------------------------------------------------------------------
+# P-8 - v2 push-approval web login (absorbed upstream #355 + D1/D2/D3 fixes)
+# --------------------------------------------------------------------------
+
+
+class _FakeV2LoginResponse:
+    """v2 login POST reply: a processId, and no countdown (there is no code)."""
+
+    status_code = 200
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"processId": "proc-v2"}
+
+
+class _FakePollResponse:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+def _v2_api(post=None, get=None, waf_token=None):
+    """Build a v2 API with stubbed transport (no network, no WAF fetch)."""
+    tr = TradeRepublicApi(
+        phone_no="+490000000000",
+        pin=PIN,
+        waf_token=waf_token,
+        read_only=True,
+        use_v2_login=True,
+    )
+    if post is not None:
+        tr._websession.post = post
+    if get is not None:
+        tr._websession.get = get
+    return tr
+
+
+# --- §4.1 / §4.2: headers, endpoint, device info, no ~/.pytr ---------------
+
+
+def test_v2_login_posts_to_v2_path_with_required_headers():
+    seen = {}
+
+    def post(url, json=None, timeout=None, headers=None):
+        seen["url"] = url
+        seen["headers"] = headers or {}
+        return _FakeV2LoginResponse()
+
+    tr = _v2_api(post=post, waf_token="waf-token-value")
+    tr.initiate_weblogin()
+
+    assert seen["url"].endswith("/api/v2/auth/web/login")
+    assert "/api/v1/" not in seen["url"]
+    h = seen["headers"]
+    assert h["x-tr-platform"] == "web"
+    assert h["x-tr-app-version"] == TR_WEB_APP_VERSION
+    assert h["x-tr-device-info"]
+    assert h["x-aws-waf-token"] == "waf-token-value"
+    assert h["Origin"] == "https://app.traderepublic.com"
+    assert h["Referer"] == "https://app.traderepublic.com/"
+
+
+def test_v2_waf_header_absent_when_no_token():
+    seen = {}
+
+    def post(url, json=None, timeout=None, headers=None):
+        seen["headers"] = headers or {}
+        return _FakeV2LoginResponse()
+
+    _v2_api(post=post, waf_token=None).initiate_weblogin()
+    assert "x-aws-waf-token" not in seen["headers"]
+
+
+def test_v1_login_still_uses_the_v1_path_and_no_v2_headers():
+    """Regression: the opt-in flag off means byte-identical v1 behavior."""
+    seen = {}
+
+    def post(url, json=None, timeout=None, headers=None):
+        seen["url"] = url
+        seen["headers"] = headers
+        return _FakeLoginResponse()
+
+    tr = _login_api(post)
+    assert tr.initiate_weblogin() == 31  # v1 still returns the countdown
+    assert seen["url"].endswith("/api/v1/auth/web/login")
+    assert seen["headers"] is None
+
+
+def test_device_info_decodes_and_carries_the_in_memory_device_id():
+    tr = _v2_api()
+    decoded = json.loads(base64.b64decode(tr._build_device_info_header()))
+    assert decoded["stableDeviceId"] == tr._device_id
+    assert len(tr._device_id) == 64
+    assert all(c in "0123456789abcdef" for c in tr._device_id)
+    assert decoded["model"] and decoded["browser"] and decoded["os"]
+
+
+def test_device_id_is_per_instance_and_not_a_doubled_half():
+    a, b = _v2_api(), _v2_api()
+    assert a._device_id != b._device_id  # D1: not a stable per-install value
+    # A doubled 32-hex half would be a fork-specific fingerprint.
+    assert a._device_id[:32] != a._device_id[32:]
+
+
+def test_v2_login_never_touches_the_pytr_home_directory(tmp_path, monkeypatch):
+    """D1 / R-104: no ~/.pytr is created or read on the v2 path."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "APPROVED"}),
+    )
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)
+
+    assert list(fake_home.iterdir()) == [], "the v2 path wrote under HOME"
+    assert not (fake_home / ".pytr").exists()
+
+
+# --- §4.3 / §4.5: PIN release, split, approval outcomes --------------------
+
+
+def test_v2_pin_released_immediately_after_the_post_not_after_approval():
+    """P-8.5: the PIN is gone before the up-to-180s approval poll begins."""
+    tr = _v2_api(post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse())
+    assert tr.pin == PIN
+    tr.initiate_weblogin()
+    assert tr.pin is None
+
+
+def test_v2_pin_released_even_when_the_post_raises():
+    def post(url, json=None, timeout=None, headers=None):
+        raise ConnectionError("network down")
+
+    tr = _v2_api(post=post)
+    with pytest.raises(ConnectionError):
+        tr.initiate_weblogin()
+    assert tr.pin is None
+
+
+def test_v2_second_initiate_weblogin_raises_without_posting():
+    calls = []
+
+    def post(url, json=None, timeout=None, headers=None):
+        calls.append(url)
+        return _FakeV2LoginResponse()
+
+    tr = _v2_api(post=post)
+    tr.initiate_weblogin()
+    with pytest.raises(ValueError, match="PIN already consumed"):
+        tr.initiate_weblogin()
+    assert len(calls) == 1
+
+
+def test_v2_initiate_returns_after_the_post_without_polling():
+    """P-8.1: the split — initiate does NOT drive the approval poll."""
+    polls = []
+
+    def get(url, headers=None, timeout=None):
+        polls.append(url)
+        return _FakePollResponse(payload={"state": "APPROVED"})
+
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=get,
+    )
+    assert tr.initiate_weblogin() == 0  # no countdown on the v2 path
+    assert polls == [], "initiate_weblogin() must not poll for approval"
+
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)  # independently callable
+    assert len(polls) == 1
+    assert "/processes/proc-v2" in polls[0]
+
+
+@pytest.mark.parametrize("state", ["APPROVED", "COMPLETED", "SUCCESS", "OK", "DONE"])
+def test_approval_succeeds_on_each_recognized_state(state):
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": state}),
+    )
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)  # must not raise
+
+
+def test_approval_succeeds_via_the_tr_session_cookie_fallback():
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "PENDING"}),
+    )
+    tr.initiate_weblogin()
+    tr._websession.cookies.set("tr_session", "session-value")
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)  # must not raise
+
+
+@pytest.mark.parametrize("state", ["REJECTED", "DECLINED", "FAILED", "EXPIRED"])
+def test_approval_rejection_raises_without_leaking_the_payload(state):
+    secret = "session-material-that-must-not-leak"
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": state, "token": secret}),
+    )
+    tr.initiate_weblogin()
+    with pytest.raises(ValueError) as excinfo:
+        tr.await_web_login_approval(timeout_s=5, interval_s=0)
+    assert state.lower() in str(excinfo.value)
+    assert secret not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 410])
+def test_expired_process_status_raises_without_leaking_the_body(status):
+    secret = "body-material-that-must-not-leak"
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(status_code=status, text=secret),
+    )
+    tr.initiate_weblogin()
+    with pytest.raises(ValueError) as excinfo:
+        tr.await_web_login_approval(timeout_s=5, interval_s=0)
+    assert str(status) in str(excinfo.value)
+    assert secret not in str(excinfo.value)
+
+
+def test_approval_deadline_raises_timeout_error():
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "PENDING"}),
+    )
+    tr.initiate_weblogin()
+    with pytest.raises(TimeoutError):
+        tr.await_web_login_approval(timeout_s=0, interval_s=0)
+
+
+def test_await_approval_before_initiate_raises():
+    with pytest.raises(ValueError, match="Initiate web login first"):
+        _v2_api().await_web_login_approval(timeout_s=5, interval_s=0)
+
+
+# --- §4.4: explicit timeouts and a monotonic, poll-start deadline ----------
+
+
+def test_v2_login_post_and_poll_get_pass_an_explicit_timeout():
+    """D2: no `requests` call on the v2 path may use the infinite default."""
+    timeouts = []
+
+    def post(url, json=None, timeout=None, headers=None):
+        timeouts.append(timeout)
+        return _FakeV2LoginResponse()
+
+    def get(url, headers=None, timeout=None):
+        timeouts.append(timeout)
+        return _FakePollResponse(payload={"state": "APPROVED"})
+
+    tr = _v2_api(post=post, get=get)
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)
+
+    assert len(timeouts) == 2
+    assert all(t == DEFAULT_NETWORK_TIMEOUT for t in timeouts)
+
+
+def test_poll_deadline_is_monotonic_and_gates_the_start_of_each_request(monkeypatch):
+    """P-8.3 soft-deadline semantics: a GET started just before the deadline is
+    the last one; the *next* deadline check raises. Also proves the loop reads
+    the monotonic clock, not the NTP-jumpable wall clock."""
+    # Three reads, and no more: deadline, one in-window check, one past it. The
+    # loop driving off this iterator to exhaustion IS the proof it reads
+    # monotonic — on wall-clock time these ticks would go untouched and the
+    # deadline (now + 180s real seconds) would never be reached, hanging the test.
+    ticks = iter([0.0, 179.0, 181.0])  # start, last poll start (in), then out
+    monkeypatch.setattr("pytr.api.time.monotonic", lambda: next(ticks))
+
+    polls = []
+
+    def get(url, headers=None, timeout=None):
+        polls.append(url)
+        return _FakePollResponse(payload={"state": "PENDING"})
+
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=get,
+    )
+    tr.initiate_weblogin()
+    with pytest.raises(TimeoutError):
+        tr.await_web_login_approval(timeout_s=180, interval_s=0)
+
+    assert len(polls) == 1, "the GET started before the deadline must be allowed to finish"
+    assert next(ticks, None) is None, "the loop must read the monotonic clock exactly as expected"
+
+
+# --- §4.7: redaction across a full v2 login --------------------------------
+
+
+def test_no_secret_material_is_logged_across_a_full_v2_login(caplog):
+    """P-8.4: at DEBUG, no process JSON, device-info, WAF token, or session
+    cookie value appears in any log record."""
+    waf = "waf-token-secret"
+    cookie_value = "tr-session-secret"
+    process_payload = {"state": "PENDING", "token": "process-json-secret"}
+
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload=process_payload),
+        waf_token=waf,
+    )
+    device_info = tr._build_device_info_header()
+
+    with caplog.at_level("DEBUG"):
+        tr.initiate_weblogin()
+        tr._websession.cookies.set("tr_session", cookie_value)
+        tr.await_web_login_approval(timeout_s=5, interval_s=0)
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    for secret in (waf, cookie_value, "process-json-secret", device_info, PIN):
+        assert secret not in logged, f"secret leaked into logs: {secret!r}"
+
+
+def test_v2_login_does_not_print_to_stdout(capsys):
+    """P-8.7: library code logs; a bare print would corrupt a caller that owns
+    stdout as a protocol channel."""
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse(),
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "APPROVED"}),
+    )
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)
+    assert capsys.readouterr().out == ""
+
+
+# --- §4.9: the CLI/account-helper regression for the P-8.1 split -----------
+
+
+def test_account_login_v2_drives_initiate_then_await_then_complete(monkeypatch):
+    """Without the explicit await_web_login_approval() call, account.login(v2=True)
+    would report "Logged in." with no session (P-8.1)."""
+    from pytr import account as account_mod
+
+    calls = []
+
+    class _FakeTr:
+        def resume_websession(self):
+            return False
+
+        def initiate_weblogin(self):
+            calls.append("initiate")
+            return 0
+
+        def await_web_login_approval(self):
+            calls.append("await")
+
+        def complete_weblogin(self, code):
+            calls.append(f"complete:{code!r}")
+
+        def settings(self):
+            return {}
+
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FakeTr())
+    account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+
+    assert calls == ["initiate", "await", "complete:''"]
+
+
+def test_account_login_v2_exits_when_approval_never_granted(monkeypatch):
+    from pytr import account as account_mod
+
+    completed = []
+
+    class _FakeTr:
+        def resume_websession(self):
+            return False
+
+        def initiate_weblogin(self):
+            return 0
+
+        def await_web_login_approval(self):
+            raise TimeoutError("Push approval not received within timeout.")
+
+        def complete_weblogin(self, code):
+            completed.append(code)
+
+        def settings(self):
+            return {}
+
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FakeTr())
+    with pytest.raises(SystemExit):
+        account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+    assert completed == [], "login must not report success without an approval"
