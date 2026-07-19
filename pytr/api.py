@@ -21,10 +21,12 @@
 # SOFTWARE.
 
 import asyncio
+import base64
 import json
 import os
 import pathlib
 import re
+import secrets
 import ssl
 import subprocess
 import sys
@@ -56,6 +58,34 @@ COOKIES_FILE = BASE_DIR / "cookies.txt"
 # P-5: bound WAF / document / login network operations so a hung or hostile
 # endpoint cannot pin a worker indefinitely.
 DEFAULT_NETWORK_TIMEOUT = 30
+
+# --- v2 web login (P-8, absorbed from upstream PR #355) ---------------------
+# Values captured from app.traderepublic.com on 2026-05-29. Used only when the
+# caller opts into the v2 push-approval flow. Overridable via env vars because a
+# TR bump to the web app version re-breaks login with HTTP 426 until the
+# constant is updated; the override is the documented hotfix, and the constant
+# is re-pinned at the next absorb.
+TR_WEB_APP_VERSION = os.environ.get("PYTR_TR_APP_VERSION", "15.7.0")
+TR_WEB_USER_AGENT_V2 = os.environ.get(
+    "PYTR_TR_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+)
+TR_V1_LOGIN_PATH = "/api/v1/auth/web/login"
+TR_V2_LOGIN_PATH = "/api/v2/auth/web/login"
+
+# P-8.3: how long await_web_login_approval() keeps polling, and how long it
+# sleeps between polls. This is a poll-*start* deadline (deliberately soft): a
+# GET issued just before it may still consume a full DEFAULT_NETWORK_TIMEOUT, so
+# the worst case is deadline + one network timeout. Callers that need a hard
+# wall-clock bound must impose it out of process.
+V2_APPROVAL_TIMEOUT = 180
+V2_APPROVAL_POLL_INTERVAL = 2.0
+
+#: Process states that mean the user approved the push in the TR app.
+_V2_APPROVED_STATES = ("APPROVED", "COMPLETED", "SUCCESS", "OK", "DONE")
+#: Process states that are terminal failures.
+_V2_REJECTED_STATES = ("REJECTED", "DECLINED", "FAILED", "EXPIRED")
 
 
 class ReadOnlyError(RuntimeError):
@@ -95,11 +125,19 @@ class TradeRepublicApi:
         cookies_file=None,
         waf_token="playwright",
         read_only=False,
+        use_v2_login=False,
     ):
         self.log = get_logger(__name__)
         self._locale = locale
         self._save_cookies = save_cookies
         self._waf_token = waf_token
+        self._use_v2_login = use_v2_login
+        # P-8.2 (D1): the v2 flow needs a 64-hex device id. Upstream persists it
+        # to ~/.pytr/device_id; we generate it per instance and hold it in memory
+        # only, so nothing is ever written under ~/.pytr on the v2 path (R-104).
+        # 64 hex chars of CSPRNG output, matching the web app's shape — not a
+        # doubled 32-hex half, whose repeated halves would be a fingerprint.
+        self._device_id = secrets.token_hex(32)
         # P-6: when True, every mutation method raises before any network I/O.
         # This reduces accidental exposure only; the server-side TR session
         # remains write-capable (see ADR-0006 / audit H3).
@@ -234,6 +272,43 @@ class TradeRepublicApi:
             self.log.warning("AWS WAF token not acquired. Value is None.")
         return token
 
+    def _build_device_info_header(self) -> str:
+        """Build the base64(JSON) x-tr-device-info payload the web app sends.
+
+        P-8.2: ``stableDeviceId`` is this instance's in-memory id — nothing is
+        read from or written to ``~/.pytr``.
+        """
+        payload = {
+            "stableDeviceId": self._device_id,
+            "model": "Apple Macintosh",
+            "browser": "Chrome",
+            "browserVersion": "148.0.0.0",
+            "os": "Mac OS",
+            "osVersion": "10.15.7",
+            "timezone": "Europe/Amsterdam",
+            "timezoneOffset": -120,
+            "screen": "1800x1169x30",
+            "preferredLanguages": ["en", "en-US"],
+            "numberOfCores": 12,
+            "deviceMemory": 16,
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.b64encode(raw).decode("ascii")
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Headers required by /api/v2/auth/web/login (v2 push-approval flow)."""
+        headers = {
+            "User-Agent": TR_WEB_USER_AGENT_V2,
+            "Origin": "https://app.traderepublic.com",
+            "Referer": "https://app.traderepublic.com/",
+            "x-tr-platform": "web",
+            "x-tr-app-version": TR_WEB_APP_VERSION,
+            "x-tr-device-info": self._build_device_info_header(),
+        }
+        if self._waf_token:
+            headers["x-aws-waf-token"] = self._waf_token
+        return headers
+
     def _set_waf_cookie(self, token: str):
         """Set the aws-waf-token cookie on the web session."""
         cookie = Cookie(
@@ -285,10 +360,14 @@ class TradeRepublicApi:
         else:
             self.log.warning("No WAF token available.")
 
+        login_path = TR_V2_LOGIN_PATH if self._use_v2_login else TR_V1_LOGIN_PATH
+        extra_headers = self._auth_headers() if self._use_v2_login else None
+
         try:
             r = self._websession.post(
-                f"{self._host}/api/v1/auth/web/login",
+                f"{self._host}{login_path}",
                 json={"phoneNumber": self.phone_no, "pin": self.pin},
+                headers=extra_headers,
                 timeout=DEFAULT_NETWORK_TIMEOUT,
             )
         finally:
@@ -312,12 +391,82 @@ class TradeRepublicApi:
                 raise ValueError(str(err))
             else:
                 raise ValueError("processId not in reponse")
-        return int(j["countdownInSeconds"]) + 1
+
+        if not self._use_v2_login:
+            return int(j["countdownInSeconds"]) + 1
+
+        # P-8.1: v2 uses push-to-approve in the TR mobile app — there is no code
+        # and no countdown. Unlike upstream, this method does NOT poll for the
+        # approval: it returns as soon as the POST has succeeded, and the caller
+        # drives await_web_login_approval() as a separate step. That split keeps
+        # the approval wait a distinct operation (the downstream child protocol
+        # needs the boundary) and puts the P-7 PIN release strictly before the
+        # up-to-180s poll rather than after it.
+        return 0
+
+    def await_web_login_approval(
+        self,
+        timeout_s: int = V2_APPROVAL_TIMEOUT,
+        interval_s: float = V2_APPROVAL_POLL_INTERVAL,
+    ):
+        """Block until the TR mobile-app push for this login process is approved.
+
+        Raises ``ValueError`` if the process was rejected/expired and
+        ``TimeoutError`` if no verdict arrived before the poll deadline.
+
+        P-8.3: the deadline is monotonic (upstream uses wall-clock ``time.time()``,
+        which jumps under NTP adjustment) and gates the *start* of each poll, so a
+        GET issued just before it may still run for one DEFAULT_NETWORK_TIMEOUT.
+        P-8.4: no response payload is ever interpolated into an exception or a log
+        record — only the state name and the HTTP status.
+        """
+        if not self._process_id:
+            raise ValueError("Initiate web login first.")
+        url = f"{self._host}{TR_V2_LOGIN_PATH}/processes/{self._process_id}"
+        deadline = time.monotonic() + timeout_s
+        # P-8.7: library code logs, it does not print (a bare print would also
+        # corrupt a caller that owns stdout as a protocol channel).
+        self.log.info("Approve the login in your Trade Republic mobile app (waiting up to %ss)...", timeout_s)
+        while time.monotonic() < deadline:
+            r = self._websession.get(
+                url,
+                headers=self._auth_headers(),
+                timeout=DEFAULT_NETWORK_TIMEOUT,
+            )
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                except ValueError:
+                    j = {}
+                state = str(j.get("state") or j.get("status") or "").upper()
+                if state in _V2_APPROVED_STATES:
+                    self.save_websession()
+                    self.log.info("Push approved.")
+                    return
+                if state in _V2_REJECTED_STATES:
+                    raise ValueError(f"Login process {state.lower()}.")
+                # State unknown but session cookie present? Treat as approved.
+                # Safe only because the jar starts empty for a fresh client
+                # (save_cookies=False and resume_websession() never called).
+                for c in self._websession.cookies:
+                    if c.name == "tr_session" and c.value:
+                        self.save_websession()
+                        self.log.info("Session cookie detected, login complete.")
+                        return
+            elif r.status_code in (401, 403, 404, 410):
+                raise ValueError(f"Login process rejected or expired (HTTP {r.status_code}).")
+            else:
+                self.log.warning("Login poll returned HTTP %s.", r.status_code)
+            time.sleep(interval_s)
+        raise TimeoutError("Push approval not received within timeout.")
 
     def resend_weblogin(self):
+        path = TR_V2_LOGIN_PATH if self._use_v2_login else TR_V1_LOGIN_PATH
+        headers = self._auth_headers() if self._use_v2_login else self._default_headers
         r = self._websession.post(
-            f"{self._host}/api/v1/auth/web/login/{self._process_id}/resend",
-            headers=self._default_headers,
+            f"{self._host}{path}/{self._process_id}/resend",
+            headers=headers,
+            timeout=DEFAULT_NETWORK_TIMEOUT,
         )
         r.raise_for_status()
 
@@ -325,7 +474,19 @@ class TradeRepublicApi:
         if not self._process_id and not self._websession:
             raise ValueError("Initiate web login first.")
 
-        r = self._websession.post(f"{self._host}/api/v1/auth/web/login/{self._process_id}/{verify_code}")
+        # v2 push flow: approval already happened in await_web_login_approval().
+        # An empty verify_code signals nothing left to do.
+        if self._use_v2_login and not verify_code:
+            self.save_websession()
+            return
+
+        path = TR_V2_LOGIN_PATH if self._use_v2_login else TR_V1_LOGIN_PATH
+        headers = self._auth_headers() if self._use_v2_login else None
+        r = self._websession.post(
+            f"{self._host}{path}/{self._process_id}/{verify_code}",
+            headers=headers,
+            timeout=DEFAULT_NETWORK_TIMEOUT,
+        )
         r.raise_for_status()
         self.save_websession()
 
@@ -442,7 +603,9 @@ class TradeRepublicApi:
         subscription_id = await self._next_subscription_id()
         ws = await self._get_ws()
         # P-4: log only the subscription type, not the full payload.
-        self.log.debug(f"Subscribing id={subscription_id} type={payload.get('type', '?') if isinstance(payload, dict) else '?'}")
+        self.log.debug(
+            f"Subscribing id={subscription_id} type={payload.get('type', '?') if isinstance(payload, dict) else '?'}"
+        )
         self.subscriptions[subscription_id] = payload
         await ws.send(f"sub {subscription_id} {json.dumps(payload)}")
         return subscription_id

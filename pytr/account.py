@@ -19,7 +19,7 @@ def get_settings(tr):
         return formatted_json
 
 
-def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwright"):
+def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwright", v2=False):
     """
     Handle credentials parameters and store to credentials file if requested.
     If no parameters are set but are needed then ask for input
@@ -53,7 +53,13 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
         else:
             save_cookies = False
 
-    tr = TradeRepublicApi(phone_no=phone_no, pin=pin, save_cookies=save_cookies, waf_token=waf_token)
+    tr = TradeRepublicApi(
+        phone_no=phone_no,
+        pin=pin,
+        save_cookies=save_cookies,
+        waf_token=waf_token,
+        use_v2_login=v2,
+    )
 
     # Use same login as app.traderepublic.com
     if not tr.resume_websession():
@@ -62,23 +68,36 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
         except ValueError as e:
             log.fatal(str(e))
             sys.exit(1)
-        request_time = time.time()
-        print("Enter the code you received to your mobile app as a notification.")
-        print(f"Enter nothing if you want to receive the (same) code as SMS. (Countdown: {countdown})")
-        code = input("Code: ")
-        if code == "":
-            countdown = countdown - (time.time() - request_time)
-            for remaining in range(int(countdown)):
-                print(
-                    f"Need to wait {int(countdown - remaining)} seconds before requesting SMS...",
-                    end="\r",
-                )
-                time.sleep(1)
-            print()
-            tr.resend_weblogin()
-            code = input("SMS requested. Enter the confirmation code:")
-        tr.complete_weblogin(code)
-        log.info("Logged in.")
+        if v2:
+            # v2 push-approve flow. P-8.1 split the poll out of
+            # initiate_weblogin(), so this helper must drive it explicitly —
+            # without this call complete_weblogin("") would report "Logged in."
+            # with no session.
+            try:
+                tr.await_web_login_approval()
+            except (ValueError, TimeoutError) as e:
+                log.fatal(str(e))
+                sys.exit(1)
+            tr.complete_weblogin("")
+            log.info("Logged in.")
+        else:
+            request_time = time.time()
+            print("Enter the code you received to your mobile app as a notification.")
+            print(f"Enter nothing if you want to receive the (same) code as SMS. (Countdown: {countdown})")
+            code = input("Code: ")
+            if code == "":
+                countdown = countdown - (time.time() - request_time)
+                for remaining in range(int(countdown)):
+                    print(
+                        f"Need to wait {int(countdown - remaining)} seconds before requesting SMS...",
+                        end="\r",
+                    )
+                    time.sleep(1)
+                print()
+                tr.resend_weblogin()
+                code = input("SMS requested. Enter the confirmation code:")
+            tr.complete_weblogin(code)
+            log.info("Logged in.")
 
     # P-4: never dump full account settings (PII / financial data) to logs.
     log.debug("Account settings retrieved.")
