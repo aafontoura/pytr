@@ -111,7 +111,8 @@ Web login uses the public web-login endpoints at `api.traderepublic.com`. Two va
 - **v2 (opt-in)**: `pytr login --v2`. Mirrors what
   [app.traderepublic.com](https://app.traderepublic.com/) currently does. Instead of typing a four-digit code, you
   confirm the login from a push notification in the Trade Republic mobile app. Accounts secured with an authenticator
-  app are asked for a code from that app instead. Useful if your account no longer issues a code via the app or SMS.
+  app cannot use `--v2`: the login stops with an error saying such accounts are not supported, instead of asking for
+  a code. Useful if your account no longer issues a code via the app or SMS.
   v2 does not require a WAF token; pytr skips it automatically when `--v2` is used.
   Note that Trade Republic removed the SMS resend endpoint along with the v1 web login, so there is no SMS fallback
   under `--v2`. The flag is available on every subcommand that performs a login, e.g. `pytr portfolio --v2`,
