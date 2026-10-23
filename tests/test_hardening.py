@@ -16,6 +16,7 @@ import stat
 import sys
 import time
 import types
+from concurrent.futures import Future
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +33,7 @@ import pytr.api
 # the exceptions the live module raises.
 from pytr.dl import (
     DL,
+    DOC_DOWNLOAD_TIMEOUT,
     PathTraversalError,
     _sanitize_component,
 )
@@ -227,9 +229,11 @@ def test_sanitize_component_neutralises_traversal():
 class _RecordingSession:
     def __init__(self):
         self.urls = []
+        self.timeouts = []
 
     def get(self, url, timeout=None):
         self.urls.append(url)
+        self.timeouts.append(timeout)
         return _RecordedFuture()
 
 
@@ -264,6 +268,49 @@ def test_document_string_url_on_tr_host_is_queued(tmp_path):
     dl.dl_doc(_document("https://api.traderepublic.com/api/v1/doc.pdf"), "title", None, datetime(2024, 1, 1))
     assert dl.session.urls == ["https://api.traderepublic.com/api/v1/doc.pdf"]
     assert len(dl.futures) == 1
+
+
+def test_document_download_is_bounded_by_the_timeout(tmp_path):
+    dl = _make_dl(tmp_path)
+    dl.session = _RecordingSession()
+    dl.dl_doc(_document("https://api.traderepublic.com/api/v1/doc.pdf"), "title", None, datetime(2024, 1, 1))
+    assert dl.session.timeouts == [DOC_DOWNLOAD_TIMEOUT]
+
+
+class _DocumentResponse:
+    def __init__(self, status_code, content):
+        self.status_code = status_code
+        self.content = content
+
+
+def _finished_download(path, response):
+    future = Future()
+    future.set_result(response)
+    future.filepath = path
+    return future
+
+
+def test_successful_document_response_is_persisted(tmp_path):
+    dl = _make_dl(tmp_path)
+    path = tmp_path / "Trades" / "doc.pdf"
+    dl.futures = [_finished_download(path, _DocumentResponse(200, b"%PDF-1.4"))]
+    dl.doc_urls = ["https://api.traderepublic.com/api/v1/doc.pdf"]
+    dl.done = 0
+    dl.work_responses()
+    assert path.read_bytes() == b"%PDF-1.4"
+    assert dl.done == 1
+
+
+def test_non_200_document_response_is_not_persisted(tmp_path):
+    dl = _make_dl(tmp_path)
+    path = tmp_path / "Trades" / "doc.pdf"
+    dl.futures = [_finished_download(path, _DocumentResponse(404, b"<html>not found</html>"))]
+    dl.doc_urls = ["https://api.traderepublic.com/api/v1/doc.pdf"]
+    dl.done = 0
+    dl.work_responses()
+    assert not path.exists()
+    assert not any(tmp_path.rglob("*.pdf"))
+    assert dl.done == 0
 
 
 # --------------------------------------------------------------------------
@@ -1333,3 +1380,64 @@ def test_playwright_launch_drops_the_sandbox_only_behind_the_opt_in(monkeypatch)
     assert _api()._fetch_waf_token_playwright() == "token-value"
     assert launches[0]["chromium_sandbox"] is False
     assert "--no-sandbox" in launches[0]["args"]
+
+
+# --------------------------------------------------------------------------
+# P-8' - login POST errors are mapped and unknown process states fail fast
+# --------------------------------------------------------------------------
+
+OUTDATED_APP_VERSION = {"errors": [{"errorCode": "CLIENT_VERSION_OUTDATED", "detail": "BODY-SECRET"}]}
+
+
+def test_v2_login_post_error_is_mapped_and_keeps_the_status():
+    tr = _v2_api(post=lambda url, json=None, timeout=None, headers=None: _FakePollResponse(426, OUTDATED_APP_VERSION))
+    with pytest.raises(ValueError) as excinfo:
+        tr.initiate_weblogin()
+    message = str(excinfo.value)
+    assert message.startswith(pytr.api.LOGIN_ERRORS["CLIENT_VERSION_OUTDATED"])
+    assert "HTTP status 426" in message
+    assert "BODY-SECRET" not in message
+
+
+def test_account_login_v2_logs_the_mapped_login_error_and_exits(monkeypatch, caplog, pytr_home):
+    from pytr import account as account_mod
+
+    def post(url, json=None, timeout=None, headers=None):
+        return _FakePollResponse(426, OUTDATED_APP_VERSION)
+
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _v2_api(post=post))
+    with _capture_logger(caplog, "account"):
+        with pytest.raises(SystemExit):
+            account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert pytr.api.LOGIN_ERRORS["CLIENT_VERSION_OUTDATED"] in logged
+    assert "HTTP status 426" in logged
+    assert "BODY-SECRET" not in logged
+    assert "Login request failed" not in logged
+    assert not pytr_home.exists()
+
+
+def test_approval_fails_fast_on_an_unrecognised_process_status():
+    polls = []
+
+    def get(url, headers=None, timeout=None):
+        polls.append(url)
+        return _FakePollResponse(payload={"status": "SERVER-INVENTED-STATE"})
+
+    tr = _v2_api(get=get)
+    tr.initiate_weblogin()
+    polls_before_await = len(polls)
+    with pytest.raises(ValueError) as excinfo:
+        tr.await_web_login_approval(timeout_s=1, interval_s=0)
+    assert len(polls) == polls_before_await + 1, "an unrecognised status must end the wait on its first poll"
+    assert "SERVER-INVENTED-STATE" not in str(excinfo.value)
+
+
+def test_approval_reads_the_status_key_before_the_state_key():
+    def get(url, headers=None, timeout=None):
+        return _FakePollResponse(payload={"status": "PENDING", "state": "CONFIRMED"})
+
+    tr = _v2_api(get=get)
+    tr.initiate_weblogin()
+    with pytest.raises(TimeoutError):
+        tr.await_web_login_approval(timeout_s=0.05, interval_s=0)

@@ -83,6 +83,7 @@ LOGIN_ERRORS = {
     "TOO_MANY_REQUESTS": "Too many attempts. Please wait before trying again.",
     "VALIDATION_CODE_INVALID": "That authenticator code is not correct.",
     "VALIDATION_CODE_ALREADY_USED": "That authenticator code was already used.",
+    "CLIENT_VERSION_OUTDATED": "Trade Republic rejected this app version as outdated. Set PYTR_TR_APP_VERSION.",
 }
 
 # Build version of the web frontend. Sent on every api/v2 login call.
@@ -118,6 +119,8 @@ V2_APPROVAL_POLL_INTERVAL = 2.0
 _V2_APPROVED_STATES = ("CONFIRMED", "APPROVED", "COMPLETED", "SUCCESS", "OK", "DONE")
 #: Process states that are terminal failures.
 _V2_REJECTED_STATES = ("REJECTED", "DECLINED", "FAILED", "EXPIRED")
+#: Process state while the push is still waiting for the user.
+_V2_PENDING_STATE = "PENDING"
 
 #: D-C: the contract is fixed at push approval with no second secret, so an
 #: authenticator (TOTP) account cannot complete this flow. It must fail as its
@@ -386,7 +389,11 @@ class TradeRepublicApi:
                     "Run `playwright install chromium` to download it. "
                     "Alternatively, use --v2 which does not require a WAF token."
                 ) from None
-            self.log.error("Failed to get AWS WAF token.")
+            self.log.error(
+                "Failed to get AWS WAF token. If Chromium cannot start its sandbox "
+                "(for example as root in a container), set PYTR_ALLOW_NO_SANDBOX=1 "
+                "to launch it without the sandbox."
+            )
             raise
 
         if not token:
@@ -529,7 +536,10 @@ class TradeRepublicApi:
                 "Try using --waf-token playwright to obtain a valid token, or switch to --v2 which does not require a WAF token."
             )
             raise ValueError(hint)
-        r.raise_for_status()
+        if self._use_v2_login:
+            self._raise_for_login_error(r)
+        else:
+            r.raise_for_status()
         j = r.json()
         # P-4: never log the raw login response (contains processId + PII).
         self.log.debug("Web login response received.")
@@ -633,7 +643,8 @@ class TradeRepublicApi:
             code = r.json()["errors"][0]["errorCode"]
         except (ValueError, KeyError, IndexError, TypeError):
             raise ValueError(f"Login failed with status {r.status_code}.") from None
-        raise ValueError(LOGIN_ERRORS.get(code, f"Login failed: {code}."))
+        message = LOGIN_ERRORS.get(code, f"Login failed: {code}.")
+        raise ValueError(f"{message} HTTP status {r.status_code}.")
 
     def _get_weblogin_process(self, quiet=False):
         """Read the state of the current login process."""
@@ -686,7 +697,8 @@ class TradeRepublicApi:
         self.log.info("Approve the login in your Trade Republic mobile app (waiting up to %ss)...", timeout_s)
         while time.monotonic() < deadline:
             process = self._get_weblogin_process()
-            state = str(process.get("state") or process.get("status") or "").upper()
+            status = process["status"] if "status" in process else process.get("state")
+            state = str(status or "").upper()
             self.log.debug("Login process state: %s", state or "unknown")
             if state in _V2_APPROVED_STATES:
                 self.save_websession()
@@ -694,6 +706,8 @@ class TradeRepublicApi:
                 return
             if state in _V2_REJECTED_STATES:
                 raise ValueError(f"Login process {state.lower()}.")
+            if state and state != _V2_PENDING_STATE:
+                raise ValueError("Unexpected login process status.")
             if self._weblogin_expired(process):
                 raise TimeoutError("The login request expired before approval.")
             # State unknown: a tr_session cookie issued after initiate means the session was granted.

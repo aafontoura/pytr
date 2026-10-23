@@ -1,23 +1,12 @@
-import json
 import sys
 import time
 from getpass import getpass
 
 import requests
-from pygments import formatters, highlight, lexers
 
 from .api import BASE_DIR, CREDENTIALS_FILE, TradeRepublicApi, account_kind, account_name
 from .security import assert_safe_to_read, secure_write_text
 from .utils import get_logger
-
-
-def get_settings(tr):
-    formatted_json = json.dumps(tr.settings(), indent=2)
-    if sys.stdout.isatty():
-        colorful_json = highlight(formatted_json, lexers.JsonLexer(), formatters.TerminalFormatter())
-        return colorful_json
-    else:
-        return formatted_json
 
 
 def print_accounts(tr):

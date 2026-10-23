@@ -108,6 +108,7 @@ Web login uses the public web-login endpoints at `api.traderepublic.com`. Two va
   v1 requires passing an AWS WAF token with the login request; by default pytr fetches one automatically
   via Playwright (requires the optional `playwright` extra: `pip install 'pytr[playwright]' && playwright install chromium`).
   The pure-Python alternative `--waf-token awswaf` exists but has been reported to no longer work reliably.
+  If Chromium cannot start its sandbox (for example as root in a container), set `PYTR_ALLOW_NO_SANDBOX=1` to launch it without the sandbox.
 - **v2 (opt-in)**: `pytr login --v2`. Mirrors what
   [app.traderepublic.com](https://app.traderepublic.com/) currently does. Instead of typing a four-digit code, you
   confirm the login from a push notification in the Trade Republic mobile app. Accounts secured with an authenticator
