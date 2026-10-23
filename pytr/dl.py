@@ -52,6 +52,12 @@ def _build_document_url(payload_path: str) -> str:
     return url
 
 
+def _is_tr_document_url(url: str) -> bool:
+    """Whether a document URL is https on the TR API host, exactly."""
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and parsed.netloc == _TR_API_HOST
+
+
 event_subfolder_mapping = {
     "OUTGOING_TRANSFER_DELEGATION": "Auszahlungen",
     "OUTGOING_TRANSFER": "Auszahlungen",
@@ -414,6 +420,9 @@ class DL:
         if isinstance(doc_url, dict):
             # P-2/L5: urljoin + netloc pin instead of raw string concatenation.
             doc_url = _build_document_url(doc_url["path"])
+        elif not _is_tr_document_url(doc_url):
+            self.log.warning(f"Skipping document with unexpected URL host: {urlparse(doc_url).netloc!r}")
+            return
 
         if self.flat:
             doc_url_base = doc_url.split("?")[0]

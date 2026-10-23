@@ -140,8 +140,25 @@ class ReadOnlyError(RuntimeError):
 class MalformedDeltaError(ValueError):
     """Raised on a malformed websocket delta segment (P-5).
 
-It aborts the stream with a typed, payload-free error and the caller fails the run.
-"""
+    It aborts the stream with a typed, payload-free error and the caller fails the run.
+    """
+
+
+_MUTATION_SUBSCRIPTION_TYPES = frozenset(
+    {
+        "addToWatchlist",
+        "removeFromWatchlist",
+        "simpleCreateOrder",
+        "cancelOrder",
+        "createSavingsPlan",
+        "changeSavingsPlan",
+        "cancelSavingsPlan",
+        "createPriceAlarm",
+        "cancelPriceAlarm",
+        "subscribeNews",
+        "unsubscribeNews",
+    }
+)
 
 
 def account_kind(relationship):
@@ -853,7 +870,7 @@ class TradeRepublicApi:
         response = await self._ws.recv()
 
         if not response == "connected":
-            raise ValueError(f"Connection Error: {response}")
+            raise ValueError("Connection Error: the websocket did not confirm the connection.")
 
         self.log.info("Connected.")
 
@@ -873,6 +890,8 @@ class TradeRepublicApi:
             return str(subscription_id)
 
     async def subscribe(self, payload):
+        if isinstance(payload, dict) and payload.get("type") in _MUTATION_SUBSCRIPTION_TYPES:
+            self._guard_read_only()
         subscription_id = await self._next_subscription_id()
         ws = await self._get_ws()
         # P-4: log only the subscription type, not the full payload.
@@ -956,6 +975,8 @@ class TradeRepublicApi:
                     length = int(diff[1:])
                 except ValueError as e:
                     raise MalformedDeltaError("Malformed delta segment") from None
+                if length < 0 or i + length > len(previous_response):
+                    raise MalformedDeltaError("Malformed delta segment")
                 if sign == "=":
                     result.append(previous_response[i : i + length])
                 i += length
@@ -1044,11 +1065,9 @@ class TradeRepublicApi:
         return await self.subscribe({"type": "stockDetails", "id": isin})
 
     async def add_watchlist(self, isin):
-        self._guard_read_only()
         return await self.subscribe({"type": "addToWatchlist", "instrumentId": isin})
 
     async def remove_watchlist(self, isin):
-        self._guard_read_only()
         return await self.subscribe({"type": "removeFromWatchlist", "instrumentId": isin})
 
     async def ticker(self, isin, exchange="LSX"):
@@ -1182,7 +1201,6 @@ class TradeRepublicApi:
         expiry_date=None,
         warnings_shown=None,
     ):
-        self._guard_read_only()
         parameters = {
             "type": "simpleCreateOrder",
             "clientProcessId": str(uuid.uuid4()),
@@ -1213,7 +1231,6 @@ class TradeRepublicApi:
         expiry_date=None,
         warnings_shown=None,
     ):
-        self._guard_read_only()
         parameters = {
             "type": "simpleCreateOrder",
             "clientProcessId": str(uuid.uuid4()),
@@ -1244,7 +1261,6 @@ class TradeRepublicApi:
         expiry_date=None,
         warnings_shown=None,
     ):
-        self._guard_read_only()
         parameters = {
             "type": "simpleCreateOrder",
             "clientProcessId": str(uuid.uuid4()),
@@ -1265,7 +1281,6 @@ class TradeRepublicApi:
         return await self.subscribe(parameters)
 
     async def cancel_order(self, order_id):
-        self._guard_read_only()
         return await self.subscribe({"type": "cancelOrder", "orderId": order_id})
 
     async def savings_plan_overview(self):
@@ -1284,7 +1299,6 @@ class TradeRepublicApi:
         start_date_value,
         warnings_shown=None,
     ):
-        self._guard_read_only()
         parameters = {
             "type": "createSavingsPlan",
             "warningsShown": warnings_shown if warnings_shown else [],
@@ -1312,7 +1326,6 @@ class TradeRepublicApi:
         start_date_value,
         warnings_shown=None,
     ):
-        self._guard_read_only()
         parameters = {
             "id": savings_plan_id,
             "type": "changeSavingsPlan",
@@ -1331,18 +1344,15 @@ class TradeRepublicApi:
         return await self.subscribe(parameters)
 
     async def cancel_savings_plan(self, savings_plan_id):
-        self._guard_read_only()
         return await self.subscribe({"type": "cancelSavingsPlan", "id": savings_plan_id})
 
     async def price_alarm_overview(self):
         return await self.subscribe({"type": "priceAlarms"})
 
     async def create_price_alarm(self, isin, price):
-        self._guard_read_only()
         return await self.subscribe({"type": "createPriceAlarm", "instrumentId": isin, "targetPrice": price})
 
     async def cancel_price_alarm(self, price_alarm_id):
-        self._guard_read_only()
         return await self.subscribe({"type": "cancelPriceAlarm", "id": price_alarm_id})
 
     async def news(self, isin):
@@ -1352,11 +1362,9 @@ class TradeRepublicApi:
         return await self.subscribe({"type": "newsSubscriptions"})
 
     async def subscribe_news(self, isin):
-        self._guard_read_only()
         return await self.subscribe({"type": "subscribeNews", "instrumentId": isin})
 
     async def unsubscribe_news(self, isin):
-        self._guard_read_only()
         return await self.subscribe({"type": "unsubscribeNews", "instrumentId": isin})
 
     def payout(self, amount):
@@ -1421,6 +1429,9 @@ class TradeRepublicApi:
 
 class TradeRepublicError(ValueError):
     def __init__(self, subscription_id, subscription, error_message):
+        super().__init__(
+            f"Trade Republic returned an error for subscription {subscription_id} ({subscription.get('type')})."
+        )
         self.subscription_id = subscription_id
         self.subscription = subscription
         self.error = error_message

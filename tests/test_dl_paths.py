@@ -38,11 +38,24 @@ def make_dl(tmp_path: Path) -> DL:
     return dl
 
 
+_TR_DOCUMENT_URL = "https://api.traderepublic.com/api/v1/doc.pdf"
+
+
+def _pin_scrubbed_document_payloads(event: dict) -> None:
+    """The recorded fixtures carry scrubbed payloads (mostly ""); the naming under test does not depend on the URL."""
+    for section in event["details"]["sections"]:
+        if section["type"] == "documents":
+            for doc in section["data"]:
+                if not isinstance(doc["action"]["payload"], dict):
+                    doc["action"]["payload"] = _TR_DOCUMENT_URL
+
+
 def collect_paths(fixture_name: str, tmp_path: Path) -> list[str]:
     """Run dl_callback on a fixture; return relative posix paths of assigned documents."""
     dl = make_dl(tmp_path)
     with open(EVENTS_DIR / fixture_name, encoding="utf-8") as f:
         event = json.load(f)
+    _pin_scrubbed_document_payloads(event)
     dl.dl_callback(event)
     result = []
     for section in event["details"]["sections"]:

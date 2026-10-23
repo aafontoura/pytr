@@ -7,14 +7,18 @@ These cover the Denkeeper hardening spec acceptance criteria, notably:
 
 import asyncio
 import base64
+import contextlib
 import json
+import logging
 import os
 import re
 import stat
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+import requests
 from pathvalidate import sanitize_filepath
 
 import pytr.api
@@ -131,6 +135,27 @@ def _assert_contained(paths, output: Path) -> None:
         assert all(part not in (".", "..") for part in resolved.relative_to(root).parts)
 
 
+@contextlib.contextmanager
+def _capture_logger(caplog, name):
+    """pytr loggers stop propagation, so caplog only sees them through a handler on the logger itself."""
+    logger = logging.getLogger(name)
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.DEBUG, logger=name):
+            yield
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
+def _redirect_pytr_home(tmp_path, monkeypatch) -> Path:
+    """Point every ~/.pytr path the api module uses at a temp dir, and return that dir."""
+    base = tmp_path / ".pytr"
+    monkeypatch.setattr(pytr.api, "BASE_DIR", base)
+    monkeypatch.setattr(pytr.api, "CREDENTIALS_FILE", base / "credentials")
+    monkeypatch.setattr(pytr.api, "COOKIES_FILE", base / "cookies.txt")
+    return base
+
+
 def test_base_behavior_is_vulnerable_title_dotdot(tmp_path):
     """Documents the base vulnerability: `..` in metadata escapes output."""
     output = tmp_path / "out"
@@ -204,6 +229,48 @@ def test_build_document_url_accepts_tr_host():
     assert _build_document_url("api/v1/doc.pdf") == "https://api.traderepublic.com/api/v1/doc.pdf"
 
 
+class _RecordingSession:
+    def __init__(self):
+        self.urls = []
+
+    def get(self, url, timeout=None):
+        self.urls.append(url)
+        return _RecordedFuture()
+
+
+class _RecordedFuture:
+    pass
+
+
+def _document(payload):
+    return {"id": "doc-1", "title": "Abrechnung", "detail": "", "action": {"payload": payload}}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "https://evil.example/x.pdf",
+        "http://api.traderepublic.com/api/v1/doc.pdf",
+        "https://api.traderepublic.com.evil.example/doc.pdf",
+    ],
+)
+def test_document_string_url_off_host_is_skipped_without_request_or_file(tmp_path, payload):
+    dl = _make_dl(tmp_path)
+    dl.session = _RecordingSession()
+    dl.dl_doc(_document(payload), "title", None, datetime(2024, 1, 1))
+    assert dl.session.urls == []
+    assert dl.futures == []
+    assert not any(tmp_path.rglob("*.pdf"))
+
+
+def test_document_string_url_on_tr_host_is_queued(tmp_path):
+    dl = _make_dl(tmp_path)
+    dl.session = _RecordingSession()
+    dl.dl_doc(_document("https://api.traderepublic.com/api/v1/doc.pdf"), "title", None, datetime(2024, 1, 1))
+    assert dl.session.urls == ["https://api.traderepublic.com/api/v1/doc.pdf"]
+    assert len(dl.futures) == 1
+
+
 # --------------------------------------------------------------------------
 # P-4 - log redaction
 # --------------------------------------------------------------------------
@@ -254,6 +321,47 @@ def test_calculate_delta_raises_on_non_numeric_length():
         tr._calculate_delta("1", "=abc")
 
 
+def test_calculate_delta_applies_in_range_segments():
+    tr = _api()
+    tr._previous_responses = {"1": "ABCDEFGHIJ"}
+    assert tr._calculate_delta("1", "=4\t-2\t=4") == "ABCDGHIJ"
+    assert tr._calculate_delta("1", "=10") == "ABCDEFGHIJ"
+
+
+@pytest.mark.parametrize("delta", ["=-2", "=11", "-11", "=4\t-2\t=-1", "=4\t=-2\t=3"])
+def test_calculate_delta_raises_on_out_of_range_length(delta):
+    tr = _api()
+    tr._previous_responses = {"1": "ABCDEFGHIJ"}
+    with pytest.raises(pytr.api.MalformedDeltaError):
+        tr._calculate_delta("1", delta)
+
+
+def test_trade_republic_error_message_is_payload_free():
+    err = pytr.api.TradeRepublicError("7", {"id": "7", "type": "portfolio"}, {"secret": "ACCOUNT-SECRET"})
+    assert "ACCOUNT-SECRET" not in str(err)
+    assert "7" in str(err) and "portfolio" in str(err)
+
+
+def test_connect_error_does_not_echo_the_first_frame(monkeypatch):
+    class _FakeSocket:
+        close_code = None
+
+        async def send(self, message):
+            pass
+
+        async def recv(self):
+            return "FRAME-SECRET"
+
+    async def connect(*args, **kwargs):
+        return _FakeSocket()
+
+    monkeypatch.setattr(pytr.api.websockets, "connect", connect)
+    tr = _api()
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(tr._get_ws())
+    assert "FRAME-SECRET" not in str(exc.value)
+
+
 # --------------------------------------------------------------------------
 # P-6 - read-only guard (AC-P6.1)
 # --------------------------------------------------------------------------
@@ -302,6 +410,51 @@ def test_read_only_defaults_false():
     assert tr._read_only is False
     # guard is a no-op when not read-only
     assert tr._guard_read_only() is None
+
+
+async def _socket_must_not_open():
+    raise AssertionError("the read-only guard must run before any websocket I/O")
+
+
+@pytest.mark.parametrize(
+    "payload_type",
+    [
+        "addToWatchlist",
+        "removeFromWatchlist",
+        "simpleCreateOrder",
+        "cancelOrder",
+        "createSavingsPlan",
+        "changeSavingsPlan",
+        "cancelSavingsPlan",
+        "createPriceAlarm",
+        "cancelPriceAlarm",
+        "subscribeNews",
+        "unsubscribeNews",
+    ],
+)
+def test_read_only_subscribe_blocks_mutation_types_before_any_io(payload_type):
+    tr = pytr.api.TradeRepublicApi(phone_no="+490000000000", pin="0000", read_only=True)
+    tr._get_ws = _socket_must_not_open
+    with pytest.raises(pytr.api.ReadOnlyError):
+        asyncio.run(tr.subscribe({"type": payload_type}))
+    with pytest.raises(pytr.api.ReadOnlyError):
+        tr.blocking_subscribe({"type": payload_type})
+
+
+def test_read_only_subscribe_still_sends_read_subscriptions():
+    tr = pytr.api.TradeRepublicApi(phone_no="+490000000000", pin="0000", read_only=True)
+    sent = []
+
+    class _FakeSocket:
+        async def send(self, message):
+            sent.append(message)
+
+    async def get_ws():
+        return _FakeSocket()
+
+    tr._get_ws = get_ws
+    subscription_id = asyncio.run(tr.subscribe({"type": "timeline", "after": None}))
+    assert sent == [f"sub {subscription_id} " + json.dumps({"type": "timeline", "after": None})]
 
 
 # --------------------------------------------------------------------------
@@ -486,31 +639,26 @@ def test_v2_waf_token_travels_as_cookie_and_never_as_plain_header():
 
 def test_device_id_is_stable_and_never_persisted(tmp_path, monkeypatch):
     """D-A option 1: upstream's stable, never-persisted device identity."""
+    base = _redirect_pytr_home(tmp_path, monkeypatch)
     a, b = _v2_api(), _v2_api()
     assert a._stable_device_id() == b._stable_device_id()
     assert re.fullmatch(r"[0-9a-f]{128}", a._stable_device_id())
 
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
     device_info = a._login_headers()["X-TR-Device-Info"]
     decoded = json.loads(base64.b64decode(device_info))
     assert decoded["stableDeviceId"] == a._stable_device_id()
-    assert list(fake_home.iterdir()) == [], "device identity must not write to disk"
+    assert not base.exists(), "device identity must not write to disk"
 
 
 def test_v2_login_never_touches_the_pytr_home_directory(tmp_path, monkeypatch):
     """R-104: no ~/.pytr is created or read on the v2 path."""
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
+    base = _redirect_pytr_home(tmp_path, monkeypatch)
 
     tr = _v2_api(get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "APPROVED"}))
     tr.initiate_weblogin()
     tr.await_web_login_approval(timeout_s=5, interval_s=0)
 
-    assert list(fake_home.iterdir()) == [], "the v2 path wrote under HOME"
-    assert not (fake_home / ".pytr").exists()
+    assert not base.exists(), "the v2 path wrote under ~/.pytr"
 
 
 # --- PIN release and the initiate/await split ----------------------------
@@ -737,11 +885,12 @@ def test_no_secret_material_is_logged_across_a_full_v2_login(caplog):
     )
     device_info = tr._login_headers()["X-TR-Device-Info"]
 
-    with caplog.at_level("DEBUG"):
+    with _capture_logger(caplog, "api"):
         tr.initiate_weblogin()
         tr._websession.cookies.set("tr_session", cookie_value)
         tr.await_web_login_approval(timeout_s=5, interval_s=0)
 
+    assert any("Login process state" in r.getMessage() for r in caplog.records), "DEBUG records must be captured"
     logged = "\n".join(r.getMessage() for r in caplog.records)
     for secret in (waf, cookie_value, "process-json-secret", device_info, PIN):
         assert secret not in logged, f"secret leaked into logs: {secret!r}"
@@ -841,3 +990,83 @@ def test_account_login_v2_exits_with_the_totp_stage_error(monkeypatch):
     monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FakeTr())
     with pytest.raises(SystemExit):
         account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+
+
+class _FrameProbeTr:
+    """Stands in for the client; records whether the caller's login frame still holds the PIN."""
+
+    def __init__(self, held):
+        self._held = held
+
+    def resume_websession(self):
+        return False
+
+    def initiate_weblogin(self):
+        caller = sys._getframe(1)
+        self._held.append(any(PIN in str(value) for value in caller.f_locals.values()))
+        return 121
+
+    def await_web_login_approval(self):
+        pass
+
+    def complete_weblogin(self, code):
+        pass
+
+    def settings(self):
+        return {}
+
+
+def test_login_frame_drops_the_pin_once_the_client_is_built(monkeypatch):
+    from pytr import account as account_mod
+
+    held = []
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FrameProbeTr(held))
+    account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+    assert held == [False]
+
+
+def test_login_frame_drops_the_credentials_file_pin_once_the_client_is_built(tmp_path, monkeypatch):
+    from pytr import account as account_mod
+
+    credentials = tmp_path / "credentials"
+    secure_write_text(credentials, f"+490000000000\n{PIN}\n")
+    monkeypatch.setattr(account_mod, "CREDENTIALS_FILE", credentials)
+    held = []
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FrameProbeTr(held))
+    account_mod.login(v2=True)
+    assert held == [False]
+
+
+@pytest.mark.parametrize("stage", ["initiate", "await"])
+def test_account_login_v2_keeps_the_process_id_out_of_transport_errors(monkeypatch, caplog, stage):
+    from pytr import account as account_mod
+
+    transport_error = requests.exceptions.ConnectionError(
+        "Max retries exceeded with url: /api/v2/auth/web/login/processes/PROCESS-SECRET"
+    )
+
+    class _FakeTr:
+        def resume_websession(self):
+            return False
+
+        def initiate_weblogin(self):
+            if stage == "initiate":
+                raise transport_error
+            return 121
+
+        def await_web_login_approval(self):
+            raise transport_error
+
+        def complete_weblogin(self, code):
+            raise AssertionError("must not finalize after a transport failure")
+
+        def settings(self):
+            return {}
+
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FakeTr())
+    with _capture_logger(caplog, "account"):
+        with pytest.raises(SystemExit):
+            account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "PROCESS-SECRET" not in logged
+    assert "ConnectionError" in logged

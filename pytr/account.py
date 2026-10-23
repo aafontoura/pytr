@@ -83,45 +83,50 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
             save_cookies = False
 
     tr = TradeRepublicApi(phone_no=phone_no, pin=pin, save_cookies=save_cookies, waf_token=waf_token, use_v2_login=v2)
+    pin = lines = None
 
     # Use same login as app.traderepublic.com
     if not tr.resume_websession():
         try:
-            countdown = tr.initiate_weblogin()
-        except ValueError as e:
-            log.fatal(str(e))
-            sys.exit(1)
-        if v2:
-            # v2 push-approve flow (P-8.1). initiate_weblogin() only POSTs and
-            # probes; the approval wait is a separate operation, so this helper
-            # must drive it explicitly. Without this call complete_weblogin("")
-            # would report "Logged in." with no session. Accounts that need an
-            # authenticator app raise a distinct stage error here (D-C).
             try:
-                tr.await_web_login_approval()
-            except (ValueError, TimeoutError) as e:
+                countdown = tr.initiate_weblogin()
+            except ValueError as e:
                 log.fatal(str(e))
                 sys.exit(1)
-            tr.complete_weblogin("")
-            log.info("Logged in.")
-        else:
-            request_time = time.time()
-            print("Enter the code you received to your mobile app as a notification.")
-            print(f"Enter nothing if you want to receive the (same) code as SMS. (Countdown: {countdown})")
-            code = input("Code: ")
-            if code == "":
-                countdown = countdown - (time.time() - request_time)
-                for remaining in range(int(countdown)):
-                    print(
-                        f"Need to wait {int(countdown - remaining)} seconds before requesting SMS...",
-                        end="\r",
-                    )
-                    time.sleep(1)
-                print()
-                tr.resend_weblogin()
-                code = input("SMS requested. Enter the confirmation code:")
-            tr.complete_weblogin(code)
-            log.info("Logged in.")
+            if v2:
+                # v2 push-approve flow (P-8.1). initiate_weblogin() only POSTs and
+                # probes; the approval wait is a separate operation, so this helper
+                # must drive it explicitly. Without this call complete_weblogin("")
+                # would report "Logged in." with no session. Accounts that need an
+                # authenticator app raise a distinct stage error here (D-C).
+                try:
+                    tr.await_web_login_approval()
+                except (ValueError, TimeoutError) as e:
+                    log.fatal(str(e))
+                    sys.exit(1)
+                tr.complete_weblogin("")
+                log.info("Logged in.")
+            else:
+                request_time = time.time()
+                print("Enter the code you received to your mobile app as a notification.")
+                print(f"Enter nothing if you want to receive the (same) code as SMS. (Countdown: {countdown})")
+                code = input("Code: ")
+                if code == "":
+                    countdown = countdown - (time.time() - request_time)
+                    for remaining in range(int(countdown)):
+                        print(
+                            f"Need to wait {int(countdown - remaining)} seconds before requesting SMS...",
+                            end="\r",
+                        )
+                        time.sleep(1)
+                    print()
+                    tr.resend_weblogin()
+                    code = input("SMS requested. Enter the confirmation code:")
+                tr.complete_weblogin(code)
+                log.info("Logged in.")
+        except requests.RequestException as e:
+            log.fatal(f"Login request failed ({type(e).__name__}).")
+            sys.exit(1)
 
     # P-4: fetch the settings (also primes the securities account cache) but
     # never dump them to the logs (PII / financial data).

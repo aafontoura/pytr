@@ -119,7 +119,8 @@ def get_main_parser():
         "--v2",
         help=(
             "Use the v2 web-login flow: confirm in the Trade Republic mobile app "
-            "instead of entering an SMS/notification code. Also supports authenticator-app accounts."
+            "instead of entering an SMS/notification code. "
+            "Accounts secured with an authenticator app are not supported."
         ),
         action="store_true",
         default=False,
