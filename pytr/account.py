@@ -74,7 +74,12 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="default",
     pin = lines = None
 
     # Use same login as app.traderepublic.com
-    if not tr.resume_websession():
+    try:
+        resumed = tr.resume_websession()
+    except ConnectionError as e:
+        log.fatal(str(e))
+        sys.exit(1)
+    if not resumed:
         try:
             try:
                 countdown = tr.initiate_weblogin()

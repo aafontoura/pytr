@@ -1553,18 +1553,62 @@ def test_unparseable_expires_at_keeps_the_full_poll_window():
     assert not tr._weblogin_expired(payload)
 
 
-def test_resume_falls_back_to_a_fresh_login_when_the_probe_times_out(pytr_home):
-    secure_write_text(pytr_home / "cookies.txt", "# Netscape HTTP Cookie File\n")
-    tr = pytr.api.TradeRepublicApi(
-        phone_no="+490000000000",
-        pin=PIN,
-        waf_token=None,
-        save_cookies=True,
-        cookies_file=pytr_home / "cookies.txt",
+def _client_with_saved_session(pytr_home):
+    path = pytr_home / "cookies.txt"
+    secure_write_text(
+        path,
+        "# Netscape HTTP Cookie File\n"
+        "api.traderepublic.com\tFALSE\t/\tFALSE\t4102444800\ttr_session\tsaved-session\n",
     )
+    return pytr.api.TradeRepublicApi(
+        phone_no="+490000000000", pin=PIN, waf_token=None, save_cookies=True, cookies_file=path
+    )
+
+
+def _session_cookies(tr):
+    return [c.value for c in tr._websession.cookies if c.name == "tr_session"]
+
+
+def test_resume_keeps_the_saved_session_when_trade_republic_cannot_be_reached(pytr_home):
+    tr = _client_with_saved_session(pytr_home)
 
     def timing_out(url, headers=None, timeout=None):
         raise requests.exceptions.Timeout("the session probe timed out")
 
     tr._websession.get = timing_out
+    with pytest.raises(ConnectionError):
+        tr.resume_websession()
+    assert _session_cookies(tr) == ["saved-session"]
+
+
+def test_resume_falls_back_to_a_fresh_login_when_the_session_is_rejected(pytr_home):
+    tr = _client_with_saved_session(pytr_home)
+
+    def rejected(url, headers=None, timeout=None):
+        raise requests.exceptions.HTTPError("403 Client Error")
+
+    tr._websession.get = rejected
     assert tr.resume_websession() is False
+    assert _session_cookies(tr) == []
+
+
+def test_account_login_stops_when_the_saved_session_cannot_be_verified(monkeypatch, caplog, pytr_home):
+    from pytr import account as account_mod
+
+    initiated = []
+
+    class _FakeTr:
+        def resume_websession(self):
+            raise ConnectionError("Could not reach Trade Republic to verify the saved session.")
+
+        def initiate_weblogin(self):
+            initiated.append(True)
+            return 121
+
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FakeTr())
+    with _capture_logger(caplog, "account"):
+        with pytest.raises(SystemExit):
+            account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "Could not reach Trade Republic to verify the saved session." in logged
+    assert initiated == [], "an unverifiable session must not start a fresh login"
