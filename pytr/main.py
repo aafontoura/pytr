@@ -20,6 +20,7 @@ from pytr.event import Event
 from pytr.portfolio import PORTFOLIO_COLUMNS, Portfolio
 from pytr.rates import RATE_COLUMNS, Rates, parse_isin_input
 from pytr.savings_plans import SavingsPlans
+from pytr.security import InsecurePathError
 from pytr.timeline import Timeline
 from pytr.transactions import SUPPORTED_LANGUAGES, TransactionExporter
 from pytr.utils import check_version, get_logger
@@ -559,6 +560,15 @@ def exit_gracefully(signum, frame):
 
 
 def main():
+    try:
+        _main()
+    except InsecurePathError as e:
+        # P-1: a refused credentials, cookie or debug-log path is a fatal user error, not a crash.
+        get_logger(__name__).fatal(str(e))
+        sys.exit(1)
+
+
+def _main():
     # store the original SIGINT handler
     global original_sigint
     original_sigint = signal.getsignal(signal.SIGINT)

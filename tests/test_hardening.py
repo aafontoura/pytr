@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 import types
@@ -1669,6 +1670,41 @@ def test_assert_safe_to_read_skips_mode_bits_where_posix_modes_do_not_apply(tmp_
     assert assert_safe_to_read(f) == f
     with pytest.raises(InsecurePathError):
         assert_safe_to_read(link)
+
+
+@pytest.mark.parametrize("refusal", ["world_readable", "symlinked", "store_through_symlink"])
+def test_cli_refused_credentials_path_is_a_fatal_message_not_a_traceback(tmp_path, refusal):
+    """A refused credentials path ends the CLI with a fatal message and exit 1, and never writes the link target."""
+    home = tmp_path / "home"
+    base = home / ".pytr"
+    base.mkdir(parents=True)
+    os.chmod(base, 0o700)
+    victim = tmp_path / "victim"
+    victim.write_text("keep me\n")
+    os.chmod(victim, 0o600)
+    args = ["login", "--v2"]
+    if refusal == "world_readable":
+        (base / "credentials").write_text("+491701234567\n1234\n")
+        os.chmod(base / "credentials", 0o644)
+    elif refusal == "symlinked":
+        (base / "credentials").symlink_to(victim)
+    else:
+        (base / "credentials").symlink_to(victim)
+        args = ["login", "-n", "+491701234567", "-p", "1234", "--store_credentials"]
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytr", *args],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        env={**os.environ, "HOME": str(home)},
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=120,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "Traceback" not in result.stderr
+    assert "Refusing" in result.stderr
+    assert victim.read_text() == "keep me\n"
 
 
 def test_secure_prepare_file_leaves_an_existing_parent_directory_alone(tmp_path):
