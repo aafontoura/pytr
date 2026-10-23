@@ -14,6 +14,7 @@ import os
 import re
 import stat
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -340,12 +341,10 @@ def test_calculate_delta_raises_on_out_of_range_length(delta):
         tr._calculate_delta("1", delta)
 
 
-@pytest.mark.parametrize("delta", ["X3", "=4\tX3\t=2", "*"])
-def test_calculate_delta_raises_on_unknown_sign(delta):
+def test_calculate_delta_skips_unknown_sign_without_advancing_the_offset():
     tr = _api()
     tr._previous_responses = {"1": "ABCDEFGHIJ"}
-    with pytest.raises(pytr.api.MalformedDeltaError):
-        tr._calculate_delta("1", delta)
+    assert tr._calculate_delta("1", "=4\tX3\t=2") == "ABCDEF"
 
 
 def test_trade_republic_error_message_is_payload_free():
@@ -1255,8 +1254,10 @@ def test_silent_handshake_is_bounded_closed_and_not_kept(monkeypatch):
     async def bounded_by_the_test():
         return await asyncio.wait_for(tr._get_ws(), 5)
 
+    started = time.monotonic()
     with pytest.raises((asyncio.TimeoutError, TimeoutError)):
         asyncio.run(bounded_by_the_test())
+    assert time.monotonic() - started < 2, "only the inner network timeout may end the handshake"
     assert closed == [True]
     assert tr._ws is None
 

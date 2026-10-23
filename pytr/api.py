@@ -979,8 +979,9 @@ class TradeRepublicApi:
         previous_response = self._previous_responses[subscription_id]
         i, result = 0, []
         for diff in delta_payload.split("\t"):
-            # P-5/L1: a malformed segment (unknown sign, or non-numeric or out-of-range length) from a
-            # hostile/buggy backend raises a typed error instead of an arbitrary one. Empty segments are skipped.
+            # P-5/L1: a malformed length (non-numeric, negative, or past the previous response) from a
+            # hostile/buggy backend raises a typed error instead of an arbitrary one. Empty and unknown-sign
+            # segments are skipped without advancing the offset.
             if not diff:
                 continue
             sign = diff[0]
@@ -996,8 +997,6 @@ class TradeRepublicApi:
                 if sign == "=":
                     result.append(previous_response[i : i + length])
                 i += length
-            else:
-                raise MalformedDeltaError("Malformed delta segment")
         return "".join(result)
 
     async def _recv_subscription(self, subscription_id):
