@@ -898,6 +898,24 @@ def test_totp_account_raises_distinct_stage_error_before_any_wait():
     assert secret not in str(excinfo.value)
 
 
+def test_totp_account_is_detected_on_a_poll_when_the_probe_failed():
+    calls = []
+
+    def get(url, headers=None, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            return _FakePollResponse(status_code=500)
+        return _FakePollResponse(payload={"state": "PENDING", "requiredAction": "AUTHENTICATOR_VERIFICATION"})
+
+    tr = _v2_api(get=get)
+    tr.initiate_weblogin()
+    assert tr.weblogin_needs_authenticator is False
+
+    with pytest.raises(pytr.api.AuthenticatorRequiredError):
+        tr.await_web_login_approval(timeout_s=2, interval_s=0)
+    assert len(calls) == 2
+
+
 def test_totp_account_raises_from_complete_weblogin_too():
     tr = _v2_api()
     tr._process_id = "proc-v2"
@@ -1680,14 +1698,22 @@ def test_secure_prepare_file_creates_a_missing_parent_0700(tmp_path):
 
 
 def test_resume_returns_false_when_the_saved_jar_is_rejected(pytr_home):
+    jar = pytr_home / "cookies.txt"
+    secure_write_text(jar, "# Netscape HTTP Cookie File\n")
+    os.chmod(jar, 0o644)
     tr = pytr.api.TradeRepublicApi(
         phone_no="+490000000000",
         pin=PIN,
         waf_token=None,
         save_cookies=True,
-        cookies_file=pytr_home / "cookies.txt",
+        cookies_file=jar,
     )
-    os.chmod(pytr_home / "cookies.txt", 0o644)
+    assert stat.S_IMODE(os.stat(jar).st_mode) == 0o644
+
+    def must_not_reach_the_network(url, headers=None, timeout=None):
+        raise AssertionError("an unsafe jar must not be loaded or verified")
+
+    tr._websession.get = must_not_reach_the_network
     assert tr.resume_websession() is False
 
 

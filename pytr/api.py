@@ -267,10 +267,11 @@ class TradeRepublicApi:
         self._websession = requests.Session()
         self._websession.headers = self._default_headers
         if self._save_cookies:
-            # P-1: ensure the cookie jar's directory (0700) and file (0600)
-            # exist with safe perms before MozillaCookieJar touches them.
+            # P-1: ~/.pytr is 0700. A cookie jar is created 0600 when absent; an existing
+            # jar keeps its mode so that resume's safe-read check judges the real file.
             secure_dir(BASE_DIR)
-            secure_prepare_file(self._cookies_file)
+            if not self._cookies_file.exists():
+                secure_prepare_file(self._cookies_file)
             self._websession.cookies = MozillaCookieJar(self._cookies_file)
         self._sec_acc_no: str | None = None
         # Customer id of the account the session acts for, once it is not the login's own.
@@ -575,7 +576,6 @@ class TradeRepublicApi:
             raise ValueError("Trade Republic completed the login without a confirmation step.")
         # The second factor is on the login process, not in the login response.
         process = self._get_weblogin_process(quiet=True)
-        self._required_action = process.get("requiredAction")
         # D-B: remember the server-side expiry so it can only shorten the
         # approval poll window, never extend it (0 = the server did not say).
         self._process_expires_at = (
@@ -672,7 +672,10 @@ class TradeRepublicApi:
         if quiet and r.status_code >= 400:
             return {}
         self._raise_for_login_error(r)
-        return r.json()
+        process = r.json()
+        if "requiredAction" in process:
+            self._required_action = process["requiredAction"]
+        return process
 
     def _weblogin_deadline(self, process, fallback=120):
         """Return deadline as a Unix timestamp; fall back to a fixed window."""
@@ -712,11 +715,12 @@ class TradeRepublicApi:
         self.log.info("Approve the login in your Trade Republic mobile app (waiting up to %ss)...", timeout_s)
         while time.monotonic() < deadline:
             process = self._get_weblogin_process()
+            if self.weblogin_needs_authenticator:
+                raise AuthenticatorRequiredError(_AUTHENTICATOR_REQUIRED_MESSAGE)
             status = process.get("status") or process.get("state")
             state = str(status or "").upper()
             self.log.debug("Login process state: %s", state or "unknown")
             if state in _V2_APPROVED_STATES:
-                self.save_websession()
                 self.log.info("Login confirmed.")
                 return
             if state in _V2_REJECTED_STATES:
@@ -729,7 +733,6 @@ class TradeRepublicApi:
             # This trusts TR's cookie behaviour during pending polls, which the source cannot confirm.
             tr_session = self._tr_session_cookie()
             if tr_session is not None and tr_session != self._tr_session_at_initiate:
-                self.save_websession()
                 self.log.info("Session cookie detected, login complete.")
                 return
             time.sleep(interval)
