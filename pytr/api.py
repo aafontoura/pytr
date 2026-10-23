@@ -1018,7 +1018,9 @@ class TradeRepublicApi:
                 continue
 
             elif code == "E":
-                self.log.error("Received error message for subscription %s (%s).", subscription_id, subscription.get("type"))
+                self.log.error(
+                    "Received error message for subscription %s (%s).", subscription_id, subscription.get("type")
+                )
 
                 await self.unsubscribe(subscription_id)
 
@@ -1040,7 +1042,7 @@ class TradeRepublicApi:
             elif sign == "-" or sign == "=":
                 try:
                     length = int(diff[1:])
-                except ValueError as e:
+                except ValueError:
                     raise MalformedDeltaError("Malformed delta segment") from None
                 if length < 0 or i + length > len(previous_response):
                     raise MalformedDeltaError("Malformed delta segment")

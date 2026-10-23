@@ -1643,8 +1643,7 @@ def _client_with_saved_session(pytr_home):
     path = pytr_home / "cookies.txt"
     secure_write_text(
         path,
-        "# Netscape HTTP Cookie File\n"
-        "api.traderepublic.com\tFALSE\t/\tFALSE\t4102444800\ttr_session\tsaved-session\n",
+        "# Netscape HTTP Cookie File\napi.traderepublic.com\tFALSE\t/\tFALSE\t4102444800\ttr_session\tsaved-session\n",
     )
     return pytr.api.TradeRepublicApi(
         phone_no="+490000000000", pin=PIN, waf_token=None, save_cookies=True, cookies_file=path
