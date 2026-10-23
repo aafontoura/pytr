@@ -116,8 +116,8 @@ V2_APPROVAL_TIMEOUT = 180
 V2_APPROVAL_POLL_INTERVAL = 2.0
 
 #: Process states that mean the user approved the push in the TR app. CONFIRMED and COMPLETED are the
-#: values upstream 6cb84d8 accepts; APPROVED, SUCCESS, OK and DONE are the web-frontend states the
-#: fork's audited P-8 push-approval flow observed.
+#: values upstream 6cb84d8 accepts. APPROVED, SUCCESS, OK and DONE were introduced with the fork's P-8'
+#: commit (1569f05); no observed Trade Republic process state in this repository backs them.
 _V2_APPROVED_STATES = ("CONFIRMED", "APPROVED", "COMPLETED", "SUCCESS", "OK", "DONE")
 #: Process states that are terminal failures.
 _V2_REJECTED_STATES = ("REJECTED", "DECLINED", "FAILED", "EXPIRED")
@@ -702,7 +702,7 @@ class TradeRepublicApi:
         self.log.info("Approve the login in your Trade Republic mobile app (waiting up to %ss)...", timeout_s)
         while time.monotonic() < deadline:
             process = self._get_weblogin_process()
-            status = process["status"] if "status" in process else process.get("state")
+            status = process.get("status") or process.get("state")
             state = str(status or "").upper()
             self.log.debug("Login process state: %s", state or "unknown")
             if state in _V2_APPROVED_STATES:
@@ -969,7 +969,7 @@ class TradeRepublicApi:
 
             if subscription_id not in self.subscriptions:
                 if code != "C":
-                    self.log.debug(f"No active subscription for id {subscription_id}, dropping message")
+                    self.log.debug("Dropping websocket message for no active subscription (%d bytes).", len(response))
                 continue
             subscription = self.subscriptions[subscription_id]
 

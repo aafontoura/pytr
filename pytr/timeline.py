@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 
 from .api import TradeRepublicError
-from .utils import get_logger, preview
+from .utils import get_logger
 
 MAX_EVENT_REQUEST_BATCH = 1000
 
@@ -108,7 +108,7 @@ class Timeline:
             elif subscription.get("type", "") == "timelineDetailV2":
                 await self.process_timelineDetail(response, subscription.get("id"))
             else:
-                self.log.warning(f"unmatched subscription of type '{subscription['type']}':\n{preview(response)}")
+                self.log.warning(f"unmatched subscription of type '{subscription['type']}'")
 
         await self.tr.close()
 

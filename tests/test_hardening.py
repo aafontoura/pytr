@@ -802,6 +802,14 @@ def test_approval_accepts_the_states_upstream_reports_under_status(state):
     tr.await_web_login_approval(timeout_s=5, interval_s=0)  # must not raise
 
 
+def test_approval_falls_back_to_state_when_status_is_null():
+    tr = _v2_api(
+        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"status": None, "state": "CONFIRMED"})
+    )
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)  # must not raise
+
+
 def test_approval_succeeds_via_the_tr_session_cookie_fallback():
     tr = _v2_api(get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "PENDING"}))
     tr.initiate_weblogin()
@@ -1498,3 +1506,32 @@ def test_v2_login_with_the_default_waf_setting_never_fetches_a_playwright_token(
     assert isinstance(tr, pytr.api.TradeRepublicApi)
     assert fetched == []
     assert not pytr_home.exists()
+
+
+class _ReplayWebsocket:
+    close_code = None
+
+    def __init__(self, frames):
+        self._frames = list(frames)
+
+    async def recv(self):
+        return self._frames.pop(0)
+
+
+def test_unmatched_websocket_frame_is_dropped_without_logging_its_content(caplog):
+    unmatched = '{"type":"x","secret":"FRAME-SECRET"}'
+    ws = _ReplayWebsocket([unmatched, '1 A {"ok":true}'])
+
+    async def get_ws():
+        return ws
+
+    tr = _api()
+    tr.subscriptions = {"1": {"type": "timeline"}}
+    tr._previous_responses = {}
+    tr._get_ws = get_ws
+    with _capture_logger(caplog, "api"):
+        subscription_id, _, payload = asyncio.run(tr._recv_ws())
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert (subscription_id, payload) == ("1", {"ok": True})
+    assert "FRAME-SECRET" not in logged
+    assert any(str(len(unmatched)) in r.getMessage() for r in caplog.records)
