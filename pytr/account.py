@@ -116,7 +116,10 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
         tr.complete_weblogin(code)
         log.info("Logged in.")
 
-    log.debug(get_settings(tr))
+    # P-4: fetch the settings (also primes the securities account cache) but
+    # never dump them to the logs (PII / financial data).
+    tr.settings()
+    log.debug("Account settings retrieved.")
 
     if account is not None:
         try:

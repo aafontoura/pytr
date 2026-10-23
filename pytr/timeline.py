@@ -222,7 +222,7 @@ class Timeline:
                     f"{event['title']} -- {event['subtitle']} - {event['timestamp'][:19]}"
                     f" (action payload {action['payload']!r} does not match event id {event['id']!r})"
                 )
-                self.log.debug("payload mismatch: %s", json.dumps(event, indent=2))
+                self.log.debug("payload mismatch (event id=%s)", event.get("id", "?"))
             else:
                 await self.tr.timeline_detail_v2(event["id"])
 
@@ -252,7 +252,8 @@ class Timeline:
         event = self.timeline_details.get(subscription_id)
 
         if event is None:
-            self.log.warning(f"Ignoring unrequested event response {json.dumps(response, indent=2)}")
+            # P-4: do not dump the unrequested response (it is a full event payload).
+            self.log.warning("Ignoring unrequested event response for subscription %s", subscription_id)
             self.skipped_detail += 1
             self.finish_if_done()
             return

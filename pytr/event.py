@@ -1,4 +1,3 @@
-import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -597,7 +596,8 @@ class Event:
 
             if not ignoreEvent:
                 get_event_logger().warning(f'Ignoring unknown event "{eventdesc}"')
-                get_event_logger().debug("Unknown event %s: %s", eventdesc, json.dumps(event_dict, indent=4))
+                # P-4: log the event descriptor only, never the full payload.
+                get_event_logger().debug("Unknown event %s", eventdesc)
 
         # Return an empty Event object if we don't have an event type, as we can't parse the rest of the fields without it
         if event_type is None:
@@ -800,7 +800,8 @@ class Event:
             and eventTypeStr not in ["BENEFITS_SPARE_CHANGE_EXECUTION"]
         ):
             get_event_logger().warning("Could not parse fees from %s", eventdesc)
-            get_event_logger().debug("Failed to parse fees from %s", json.dumps(event_dict, indent=4))
+            # P-4: descriptor only, never the full payload.
+            get_event_logger().debug("Failed to parse fees from %s", eventdesc)
 
         if (
             shares is None
@@ -821,7 +822,8 @@ class Event:
             and subtitle not in ["Aktienprämiendividende", "Bardividende korrigiert", "Dividende Wahlweise", "Tilgung"]
         ):
             get_event_logger().warning("Could not parse shares from %s", eventdesc)
-            get_event_logger().debug("Failed to parse shares from: %s", json.dumps(event_dict, indent=4))
+            # P-4: descriptor only, never the full payload.
+            get_event_logger().debug("Failed to parse shares from: %s", eventdesc)
 
         return cls(event_type, date, title, isin, isin2, shares, shares2, value, fees, taxes, note)
 
@@ -881,12 +883,14 @@ class Event:
                 result = float(parse_decimal(parsed_val, locales[1], strict=True))
             except NumberFormatError:
                 return None
+            # P-4: report the offending value and the event id, never the
+            # surrounding event fields (titles, amounts, counterparties).
             get_event_logger().warning(
-                "Number %s parsed as %s although preference was %s: %s",
+                "Number %s parsed as %s although preference was %s (event id=%s)",
                 parsed_val,
                 locales[1],
                 locales[0],
-                json.dumps(dump_dict, indent=4),
+                dump_dict.get("id", "?"),
             )
             return None if result == 0.0 else result
 
@@ -898,16 +902,17 @@ class Event:
                 pass
 
         if alternative_result is None:
+            # P-4: value and event id only, never the surrounding event fields.
             get_event_logger().debug(
-                "Number %s parsed as %s: %s", parsed_val, locales[0], json.dumps(dump_dict, indent=4)
+                "Number %s parsed as %s (event id=%s)", parsed_val, locales[0], dump_dict.get("id", "?")
             )
         else:
             get_event_logger().debug(
-                "Number %s parsed as %s but could also be parsed as %s: %s",
+                "Number %s parsed as %s but could also be parsed as %s (event id=%s)",
                 parsed_val,
                 locales[0],
                 locales[1],
-                json.dumps(dump_dict, indent=4),
+                dump_dict.get("id", "?"),
             )
 
         return None if result == 0.0 else result
