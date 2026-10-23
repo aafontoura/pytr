@@ -138,7 +138,10 @@ class ReadOnlyError(RuntimeError):
 
 
 class MalformedDeltaError(ValueError):
-    """Raised on a malformed websocket delta segment so the recv loop can reconnect (P-5)."""
+    """Raised on a malformed websocket delta segment (P-5).
+
+It aborts the stream with a typed, payload-free error and the caller fails the run.
+"""
 
 
 def account_kind(relationship):
@@ -930,7 +933,7 @@ class TradeRepublicApi:
                 continue
 
             elif code == "E":
-                self.log.error(f"Received error message: {response!r}")
+                self.log.error("Received error message for subscription %s (%s).", subscription_id, subscription.get("type"))
 
                 await self.unsubscribe(subscription_id)
 
@@ -942,7 +945,7 @@ class TradeRepublicApi:
         i, result = 0, []
         for diff in delta_payload.split("\t"):
             # P-5/L1: a malformed segment (empty, or non-numeric length) from a
-            # hostile/buggy backend must not crash the recv loop.
+            # hostile/buggy backend raises a typed error instead of an arbitrary one.
             if not diff:
                 continue
             sign = diff[0]
@@ -952,7 +955,7 @@ class TradeRepublicApi:
                 try:
                     length = int(diff[1:])
                 except ValueError as e:
-                    raise MalformedDeltaError(f"Malformed delta segment: {diff!r}") from e
+                    raise MalformedDeltaError("Malformed delta segment") from None
                 if sign == "=":
                     result.append(previous_response[i : i + length])
                 i += length
