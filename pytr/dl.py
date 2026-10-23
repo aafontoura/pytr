@@ -509,7 +509,7 @@ class DL:
                 else:
                     filepath = filepath_with_doc_id
 
-        # P-2: authoritative containment check — the resolved path MUST stay
+        # P-2: authoritative containment check: the resolved path MUST stay
         # strictly under the resolved output directory, or we refuse the write.
         filepath = self._ensure_contained(filepath)
 

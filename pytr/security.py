@@ -122,7 +122,7 @@ def redact(value: Any) -> Any:
 
     Only structural, allow-listed-shape data survives; anything under a secret
     key name is replaced. Strings/other scalars pass through unchanged (callers
-    must not pass raw secrets as bare scalars — use :func:`safe_fields`).
+    must not pass raw secrets as bare scalars; use :func:`safe_fields`).
     """
     if isinstance(value, dict):
         out = {}
