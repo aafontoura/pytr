@@ -570,7 +570,9 @@ class TradeRepublicApi:
         self._required_action = process.get("requiredAction")
         # D-B: remember the server-side expiry so it can only shorten the
         # approval poll window, never extend it (0 = the server did not say).
-        self._process_expires_at = self._weblogin_deadline(process) if process.get("expiresAt") else 0
+        self._process_expires_at = (
+            self._weblogin_deadline(process, fallback=float("inf")) if process.get("expiresAt") else 0
+        )
         self._tr_session_at_initiate = self._tr_session_cookie()
         # v2 does not always send countdownInSeconds; the web frontend falls back to 120s.
         return int(j.get("countdownInSeconds", 120)) + 1
@@ -715,7 +717,8 @@ class TradeRepublicApi:
                 raise ValueError("Unexpected login process status.")
             if self._weblogin_expired(process):
                 raise TimeoutError("The login request expired before approval.")
-            # State unknown: a tr_session cookie issued after initiate means the session was granted.
+            # A tr_session that is new or changed since initiate counts as approval, even while the state is PENDING.
+            # This trusts TR's cookie behaviour during pending polls, which the source cannot confirm.
             tr_session = self._tr_session_cookie()
             if tr_session is not None and tr_session != self._tr_session_at_initiate:
                 self.save_websession()
@@ -768,7 +771,7 @@ class TradeRepublicApi:
         try:
             self.log.debug("Calling settings...")
             self.settings()
-        except requests.exceptions.HTTPError:
+        except requests.exceptions.RequestException:
             self.log.info("Resuming websession failed.")
             self.log.debug("Error calling tr.settings().", exc_info=True)
             # in case the websession can not be resumed, start with a fresh set of cookies

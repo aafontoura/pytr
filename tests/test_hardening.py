@@ -980,27 +980,35 @@ def test_server_expiry_only_shortens_the_poll_window(monkeypatch):
 # --- redaction across a full v2 login (P-8.4/P-8.7) ----------------------
 
 
-def test_no_secret_material_is_logged_across_a_full_v2_login(caplog):
-    """P-8.4: at DEBUG, no WAF token, session cookie, process JSON, device
-    info or PIN appears in any log record."""
+def test_no_secret_material_is_logged_across_a_full_v2_login(caplog, monkeypatch, pytr_home):
+    """P-8.4: at DEBUG, across a full account.login(v2=True), no WAF token, session cookie,
+    process JSON, device info, PIN, phone or account settings appears in any log record."""
+    from pytr import account as account_mod
+
     waf = "waf-token-secret"
     cookie_value = "tr-session-secret"
-    process_payload = {"state": "PENDING", "token": "process-json-secret"}
+    settings_pii = "settings-pii-secret"
+    process_payload = {"state": "CONFIRMED", "token": "process-json-secret"}
+    device_info = _v2_api()._login_headers()["X-TR-Device-Info"]
 
-    tr = _v2_api(
-        get=lambda url, headers=None, timeout=None: _FakePollResponse(payload=process_payload),
-        waf_token=waf,
-    )
-    device_info = tr._login_headers()["X-TR-Device-Info"]
-
-    with _capture_logger(caplog, "api"):
-        tr.initiate_weblogin()
+    def stubbed_client(**kwargs):
+        tr = pytr.api.TradeRepublicApi(**kwargs)
         tr._websession.cookies.set("tr_session", cookie_value)
-        tr.await_web_login_approval(timeout_s=5, interval_s=0)
+        tr._websession.post = lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse()
+        tr._websession.get = lambda url, headers=None, timeout=None: _FakePollResponse(payload=process_payload)
+        tr._websession.request = lambda method, url, data=None, headers=None, timeout=None: _FakePollResponse(
+            payload={"name": settings_pii}
+        )
+        return tr
 
-    assert any("Login process state" in r.getMessage() for r in caplog.records), "DEBUG records must be captured"
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", stubbed_client)
+    with _capture_logger(caplog, "api"), _capture_logger(caplog, "account"):
+        account_mod.login(phone_no="+490000000000", pin=PIN, waf_token=waf, v2=True)
+
+    assert any(r.name == "api" for r in caplog.records), "DEBUG records of the api logger must be captured"
+    assert any(r.name == "account" for r in caplog.records), "records of the account logger must be captured"
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    for secret in (waf, cookie_value, "process-json-secret", device_info, PIN):
+    for secret in (waf, cookie_value, "process-json-secret", device_info, PIN, "+490000000000", settings_pii):
         assert secret not in logged, f"secret leaked into logs: {secret!r}"
 
 
@@ -1534,4 +1542,29 @@ def test_unmatched_websocket_frame_is_dropped_without_logging_its_content(caplog
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert (subscription_id, payload) == ("1", {"ok": True})
     assert "FRAME-SECRET" not in logged
-    assert any(str(len(unmatched)) in r.getMessage() for r in caplog.records)
+    assert any(r.getMessage().startswith("Dropping websocket message") for r in caplog.records)
+
+
+def test_unparseable_expires_at_keeps_the_full_poll_window():
+    payload = {"state": "PENDING", "expiresAt": "not-a-timestamp"}
+    tr = _v2_api(get=lambda url, headers=None, timeout=None: _FakePollResponse(payload=payload))
+    tr.initiate_weblogin()
+    assert tr._clamp_approval_timeout(180) == 180
+    assert not tr._weblogin_expired(payload)
+
+
+def test_resume_falls_back_to_a_fresh_login_when_the_probe_times_out(pytr_home):
+    secure_write_text(pytr_home / "cookies.txt", "# Netscape HTTP Cookie File\n")
+    tr = pytr.api.TradeRepublicApi(
+        phone_no="+490000000000",
+        pin=PIN,
+        waf_token=None,
+        save_cookies=True,
+        cookies_file=pytr_home / "cookies.txt",
+    )
+
+    def timing_out(url, headers=None, timeout=None):
+        raise requests.exceptions.Timeout("the session probe timed out")
+
+    tr._websession.get = timing_out
+    assert tr.resume_websession() is False
