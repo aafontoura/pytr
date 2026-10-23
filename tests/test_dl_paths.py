@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from pytr.dl import DL
+from pytr.dl import DL, PathTraversalError
 
 EVENTS_DIR = Path(__file__).parent / "events"
 FMT = "{iso_date} {time} {title}"
@@ -392,3 +392,58 @@ test_data: list[dict] = [
 @pytest.mark.parametrize("case", test_data, ids=[c["filename"] for c in test_data])
 def test_dl_paths(case, tmp_path):
     assert collect_paths(case["filename"], tmp_path) == case["paths"]
+
+
+# --- Containment (hardening P-2) -------------------------------------------
+
+
+def _traversal_event() -> dict:
+    """An event whose server-derived metadata tries to escape output_path."""
+    return {
+        "id": "event-1",
+        "timestamp": "2024-01-01T09:00:00+02:00",
+        "title": "..",
+        "subtitle": "../../escape",
+        "eventType": "TRADE_INVOICE",
+        "details": {
+            "sections": [
+                {
+                    "type": "documents",
+                    "data": [
+                        {
+                            "id": "../../../etc/evil",
+                            "title": "Abrechnung",
+                            "detail": "..",
+                            "action": {"payload": "https://api.traderepublic.com/api/v1/doc.pdf"},
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+
+
+def test_malicious_metadata_stays_contained(tmp_path):
+    """P-2: title/subtitle/doc id from the server must not escape output_path."""
+    dl = make_dl(tmp_path)
+    event = _traversal_event()
+    dl.dl_callback(event)
+    assigned = [
+        Path(doc["local_filepath"])
+        for section in event["details"]["sections"]
+        for doc in section["data"]
+        if "local_filepath" in doc
+    ]
+    assert assigned, "expected the document to be queued"
+    root = tmp_path.resolve()
+    for path in assigned:
+        resolved = path.resolve()
+        assert resolved.is_relative_to(root)
+        assert ".." not in resolved.relative_to(root).parts
+
+
+def test_ensure_contained_rejects_escape(tmp_path):
+    """P-2: the authoritative guard refuses any path outside output_path."""
+    dl = make_dl(tmp_path)
+    with pytest.raises(PathTraversalError):
+        dl._ensure_contained(tmp_path / ".." / "escape.pdf")
