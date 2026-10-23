@@ -1569,16 +1569,40 @@ def _session_cookies(tr):
     return [c.value for c in tr._websession.cookies if c.name == "tr_session"]
 
 
-def test_resume_keeps_the_saved_session_when_trade_republic_cannot_be_reached(pytr_home):
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        requests.exceptions.Timeout("the session probe timed out"),
+        requests.exceptions.ConnectionError("connection reset"),
+    ],
+)
+def test_resume_keeps_the_saved_session_when_trade_republic_cannot_be_reached(pytr_home, transport_error):
     tr = _client_with_saved_session(pytr_home)
 
-    def timing_out(url, headers=None, timeout=None):
-        raise requests.exceptions.Timeout("the session probe timed out")
+    def failing(url, headers=None, timeout=None):
+        raise transport_error
 
-    tr._websession.get = timing_out
+    tr._websession.get = failing
     with pytest.raises(ConnectionError):
         tr.resume_websession()
     assert _session_cookies(tr) == ["saved-session"]
+
+
+def _response(status, content=b""):
+    response = requests.Response()
+    response.status_code = status
+    response._content = content
+    return response
+
+
+def test_resume_falls_back_to_a_fresh_login_when_the_probe_body_is_not_json(pytr_home):
+    tr = _client_with_saved_session(pytr_home)
+    tr._websession.get = lambda url, headers=None, timeout=None: _response(200)
+    tr._websession.request = lambda method, url, data=None, headers=None, timeout=None: _response(
+        200, b"<html>maintenance</html>"
+    )
+    assert tr.resume_websession() is False
+    assert _session_cookies(tr) == []
 
 
 def test_resume_falls_back_to_a_fresh_login_when_the_session_is_rejected(pytr_home):

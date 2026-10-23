@@ -771,14 +771,15 @@ class TradeRepublicApi:
         try:
             self.log.debug("Calling settings...")
             self.settings()
-        except requests.exceptions.HTTPError:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            self.log.debug("Could not reach Trade Republic to verify the saved session.", exc_info=True)
+            raise ConnectionError("Could not reach Trade Republic to verify the saved session.") from e
+        except requests.exceptions.RequestException:
             self.log.info("Resuming websession failed.")
             self.log.debug("Error calling tr.settings().", exc_info=True)
             # in case the websession can not be resumed, start with a fresh set of cookies
             self._websession.cookies.clear()
             return False
-        except requests.exceptions.RequestException:
-            raise ConnectionError("Could not reach Trade Republic to verify the saved session.") from None
 
         self.log.info("Websession resumed.")
         return True
