@@ -66,6 +66,9 @@ COOKIES_FILE = BASE_DIR / "cookies.txt"
 # endpoint cannot pin a worker indefinitely.
 DEFAULT_NETWORK_TIMEOUT = 30
 
+# The shapes of stableDeviceId the web frontend (SHA-512) and earlier clients (SHA-256) have sent.
+DEVICE_ID_PATTERN = re.compile(r"[0-9a-f]{64,128}")
+
 # Hosts that `_fetch_waf_token_awswaf` is allowed to talk to. The challenge
 # endpoint is scraped out of the login page with a regular expression, so
 # whatever `app.traderepublic.com` serves decides where the follow-up requests
@@ -226,8 +229,14 @@ class TradeRepublicApi:
         use_v2_login=False,
         waf_token="default",
         read_only=False,
+        device_id=None,
     ):
         self.log = get_logger(__name__)
+        # The derived fingerprint changes across hosts and containers, so a caller that needs one
+        # stable identity passes its own. It lives in memory only; the message never echoes it.
+        if device_id is not None and not (isinstance(device_id, str) and DEVICE_ID_PATTERN.fullmatch(device_id)):
+            raise ValueError("device_id must be 64 to 128 lowercase hexadecimal characters.")
+        self._device_id = device_id
         self._locale = locale
         self._save_cookies = save_cookies
         self._use_v2_login = use_v2_login
@@ -462,7 +471,7 @@ class TradeRepublicApi:
             chrome = re.search(r"Chrome/([\d.]+)", self._websession.headers.get("User-Agent", ""))
             offset = datetime.now().astimezone().utcoffset()
             device = {
-                "stableDeviceId": self._stable_device_id(),
+                "stableDeviceId": self._device_id or self._stable_device_id(),
                 "browser": "Chrome",
                 "browserVersion": chrome.group(1) if chrome else "",
                 "os": platform.system(),

@@ -118,6 +118,10 @@ Web login uses the public web-login endpoints at `api.traderepublic.com`. Two va
   Note that Trade Republic removed the SMS resend endpoint along with the v1 web login, so there is no SMS fallback
   under `--v2`. The flag is available on every subcommand that performs a login, e.g. `pytr portfolio --v2`,
   `pytr dl_docs --v2`.
+  v2 identifies the device with an id derived from the machine, which is not stable across hosts and containers
+  (on some systems not even across runs). A library caller that needs one stable identity passes its own:
+  `TradeRepublicApi(..., use_v2_login=True, device_id=...)`, 64 to 128 lowercase hexadecimal characters.
+  pytr keeps it in memory only; storing it is up to the caller.
 
 Both variants keep you logged in on your primary device, but you may need to re-authenticate every so often when
 running `pytr`.

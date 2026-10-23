@@ -723,6 +723,70 @@ def test_device_id_is_stable_and_never_persisted(pytr_home):
     assert not pytr_home.exists(), "device identity must not write to disk"
 
 
+GIVEN_DEVICE_ID = "ab" * 40
+
+
+def _device_id_api(record, **kwargs):
+    """A v2 client with the given device id whose stubbed transport records every request's headers."""
+
+    def post(url, json=None, timeout=None, headers=None, **kw):
+        record.append(headers or {})
+        return _FakeV2LoginResponse()
+
+    def get(url, headers=None, timeout=None):
+        record.append(headers or {})
+        return _FakePollResponse(payload={"state": "APPROVED"})
+
+    def request(method, url, data=None, headers=None, timeout=None):
+        record.append(headers or {})
+        return _FakePollResponse(payload={})
+
+    params = {"phone_no": "+490000000000", "pin": PIN, "waf_token": None, "use_v2_login": True, **kwargs}
+    tr = pytr.api.TradeRepublicApi(device_id=GIVEN_DEVICE_ID, **params)
+    tr._websession.post = post
+    tr._websession.get = get
+    tr._websession.request = request
+    return tr
+
+
+def test_given_device_id_rides_on_every_v2_call(pytr_home):
+    """test-1: a caller-supplied device id replaces the derived one on the login POST, the
+    requiredAction probe, the approval poll, the session refresh and the session POST."""
+    seen = []
+    tr = _device_id_api(seen)
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)
+    tr.complete_weblogin("")
+    tr.settings()
+    tr._post_session("subject-1")
+
+    assert len(seen) == 6  # POST, probe, poll, session refresh, account read, session POST
+    for h in seen:
+        assert json.loads(base64.b64decode(h["X-TR-Device-Info"]))["stableDeviceId"] == GIVEN_DEVICE_ID
+
+
+@pytest.mark.parametrize("device_id", ["", "ab" * 31, "ab" * 65, "AB" * 40, "g" * 64, 12345])
+def test_malformed_device_id_is_refused_at_construction_without_echoing_it(device_id):
+    with pytest.raises(ValueError, match=r"^device_id must be 64 to 128 lowercase hexadecimal characters\.$"):
+        pytr.api.TradeRepublicApi(phone_no="+490000000000", pin=PIN, use_v2_login=True, device_id=device_id)
+
+
+def test_given_device_id_is_never_logged_or_written(caplog, monkeypatch, pytr_home):
+    """test-1: across a full account.login(v2=True) at DEBUG the given id never reaches a log
+    record, and nothing is written under ~/.pytr."""
+    from pytr import account as account_mod
+
+    seen = []
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kwargs: _device_id_api(seen, **kwargs))
+    with _capture_logger(caplog, "api"), _capture_logger(caplog, "account"):
+        account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+
+    assert seen, "the login must have reached the stubbed transport"
+    assert any(r.name == "api" for r in caplog.records)
+    assert GIVEN_DEVICE_ID not in "\n".join(r.getMessage() for r in caplog.records)
+    assert not pytr_home.exists(), "a given device id must not write to disk"
+
+
 def test_v2_login_never_touches_the_pytr_home_directory(pytr_home):
     """R-104: no ~/.pytr is created or read on the v2 path."""
     tr = _v2_api(get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "APPROVED"}))
