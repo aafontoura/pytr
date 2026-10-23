@@ -52,20 +52,20 @@ class _Session:
         self.cookies = None
         self.headers = dict(TradeRepublicApi._default_headers)
 
-    def _record(self, method: str, url: str, json: Any = None, headers: Any = None) -> _Response:
-        self.calls.append({"method": method, "url": url, "json": json, "headers": headers or {}})
+    def _record(self, method: str, url: str, json: Any = None, headers: Any = None, timeout: Any = None) -> _Response:
+        self.calls.append({"method": method, "url": url, "json": json, "headers": headers or {}, "timeout": timeout})
         reply = self._replies.pop(0) if self._replies else {}
         status, payload = reply if isinstance(reply, tuple) else (200, reply)
         return _Response(url, payload, status)
 
-    def post(self, url, json=None, headers=None):
-        return self._record("POST", url, json, headers)
+    def post(self, url, json=None, headers=None, timeout=None):
+        return self._record("POST", url, json, headers, timeout)
 
-    def get(self, url, headers=None):
-        return self._record("GET", url, None, headers)
+    def get(self, url, headers=None, timeout=None):
+        return self._record("GET", url, None, headers, timeout)
 
-    def request(self, method, url, data=None):
-        return self._record(method, url, None, None)
+    def request(self, method, url, data=None, timeout=None):
+        return self._record(method, url, None, None, timeout)
 
 
 def _api(replies):
