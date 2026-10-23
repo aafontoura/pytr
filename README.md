@@ -13,8 +13,9 @@ __Table of Contents__
 * [Quickstart](#quickstart)
 * [Usage](#usage)
 * [Authentication](#authentication)
-  * [Web login (default)](#web-login-default)
-  * [App login](#app-login)
+  * [Web login](#web-login)
+  * [If web login suddenly stops working](#if-web-login-suddenly-stops-working)
+  * [Other accounts of your login](#other-accounts-of-your-login)
 * [Development](#development)
   * [Setting Up a Development Environment](#setting-up-a-development-environment)
   * [Linting and Code Formatting](#linting-and-code-formatting)
@@ -62,16 +63,18 @@ If you want to use the cutting-edge version, use this command instead:
 <!-- runcmd code:console uv run --python 3.13 pytr help --for-readme -->
 ```console
 usage: pytr [-h] [-V] [-v {warning,info,debug}] [--debug-logfile DEBUG_LOGFILE] [--debug-log-filter DEBUG_LOG_FILTER]
-            {help,login,portfolio,rates,details,dl_docs,export_transactions,get_price_alarms,set_price_alarms,get_savings_plans,completion} ...
+            {help,login,accounts,portfolio,rates,details,dl_docs,export_transactions,get_price_alarms,set_price_alarms,get_savings_plans,completion} ...
 
 Use "pytr command_name --help" to get detailed help to a specific command
 
 Commands:
-  {help,login,portfolio,rates,details,dl_docs,export_transactions,get_price_alarms,set_price_alarms,get_savings_plans,completion}
+  {help,login,accounts,portfolio,rates,details,dl_docs,export_transactions,get_price_alarms,set_price_alarms,get_savings_plans,completion}
                                         Desired action to perform
     help                                Print this help message
     login                               Check if credentials file exists. If not create it and ask for input. Try to
                                         login. Ask for device reset if needed
+    accounts                            List accounts of this login, e.g. a company accounts or child accounts. Use them
+                                        with --account
     portfolio                           Show current portfolio
     rates                               Fetch current prices for a list of ISINs given as direct list or CSV input
     details                             Get details for an ISIN
@@ -96,28 +99,65 @@ Options:
 
 ## Authentication
 
-There are two authentication methods:
+### Web login
 
-### Web login (default)
+Web login uses the public web-login endpoints at `api.traderepublic.com`. Two variants are available:
 
-Web login is the newer method that uses the same login method as [app.traderepublic.com](https://app.traderepublic.com/),
-meaning you receive a four-digit code in the TradeRepublic app or via SMS. This will keep you logged in your primary
-device, but means that you may need to repeat entering a new four-digit code ever so often when runnnig `pytr`.
+- **v1 (default)**: `pytr login`. You receive a four-digit code in the TradeRepublic app (or via SMS as a
+  fallback) and enter it in the terminal. This is the original behavior; nothing changes for existing users.
+  v1 requires passing an AWS WAF token with the login request; by default pytr fetches one automatically
+  via Playwright (requires the optional `playwright` extra: `pip install 'pytr[playwright]' && playwright install chromium`).
+  The pure-Python alternative `--waf-token awswaf` exists but has been reported to no longer work reliably.
+- **v2 (opt-in)**: `pytr login --v2`. Mirrors what
+  [app.traderepublic.com](https://app.traderepublic.com/) currently does. Instead of typing a four-digit code, you
+  confirm the login from a push notification in the Trade Republic mobile app. Accounts secured with an authenticator
+  app are asked for a code from that app instead. Useful if your account no longer issues a code via the app or SMS.
+  v2 does not require a WAF token; pytr skips it automatically when `--v2` is used.
+  Note that Trade Republic removed the SMS resend endpoint along with the v1 web login, so there is no SMS fallback
+  under `--v2`. The flag is available on every subcommand that performs a login, e.g. `pytr portfolio --v2`,
+  `pytr dl_docs --v2`.
 
-### App login
+Both variants keep you logged in on your primary device, but you may need to re-authenticate every so often when
+running `pytr`.
 
-App login is the older method that uses the same login method as the TradeRepublic app. First you need to perform a
-device reset - a private key will be generated that pins your "device". The private key is saved to your keyfile. This
-procedure will log you out from your mobile device.
+### If web login suddenly stops working
+
+The web login identifies itself to Trade Republic as their own web frontend, using a build version, a platform name
+and a browser `User-Agent` that are pinned in `pytr`. Trade Republic can invalidate any of them at any time, and when
+they do, login fails for everyone until a new release goes out. Three environment variables let you fix it yourself
+in the meantime:
+
+| Variable | Overrides | Use it when |
+|---|---|---|
+| `PYTR_TR_APP_VERSION` | The frontend build version sent as `X-TR-App-Version` | Login fails with `426 CLIENT_VERSION_OUTDATED` |
+| `PYTR_TR_USER_AGENT` | The `User-Agent` sent on every request | Login is rejected or challenged in a way that looks like bot filtering |
+| `PYTR_TR_PLATFORM` | The platform name sent as `X-Tr-Platform` | Login fails with a missing or invalid header error naming the platform |
 
 ```sh
- pytr login
- # or
- pytr login --phone_no +49123456789 --pin 1234
+ PYTR_TR_APP_VERSION=2.2700.4 pytr login --v2
+ PYTR_TR_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36' pytr login
+ PYTR_TR_PLATFORM=web pytr login --v2
 ```
 
-If no arguments are supplied pytr will look for them in the file `~/.pytr/credentials` (the first line must contain
-the phone number, the second line the pin). If the file doesn't exist pytr will ask for for the phone number and pin.
+Read the current values off [app.traderepublic.com](https://app.traderepublic.com/) in your browser's dev tools, on the
+network request to `/api/v2/auth/web/login`. Leaving a variable unset, or setting it to an empty string, keeps the
+built-in default. If you need one of these, please also open an issue so the default can be updated for everyone.
+
+### Other accounts of your login
+
+A Trade Republic login can hold more than its own account, e.g. company accounts or child accounts. Trade Republic
+treats each of them as a customer of its own, and the web app switches between them after the login. Pass `--account`
+to do the same, on any subcommand that performs a login:
+
+```sh
+pytr portfolio --account LEGAL_ENTITY
+pytr dl_docs --account "Mustermann Holding GmbH" ./docs
+```
+
+The value is the account's type, its name or its customer id, as listed by `pytr accounts`. Without `--account`,
+pytr uses your own account. The choice is not remembered between runs.
+
+Unfortunately, it seems that this only works with company accounts, not with child accounts at the moment.
 
 ## Development
 
