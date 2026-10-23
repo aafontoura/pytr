@@ -115,7 +115,9 @@ ENV_USER_AGENT = "PYTR_TR_USER_AGENT"
 V2_APPROVAL_TIMEOUT = 180
 V2_APPROVAL_POLL_INTERVAL = 2.0
 
-#: Process states that mean the user approved the push in the TR app.
+#: Process states that mean the user approved the push in the TR app. CONFIRMED and COMPLETED are the
+#: values upstream 6cb84d8 accepts; APPROVED, SUCCESS, OK and DONE are the web-frontend states the
+#: fork's audited P-8 push-approval flow observed.
 _V2_APPROVED_STATES = ("CONFIRMED", "APPROVED", "COMPLETED", "SUCCESS", "OK", "DONE")
 #: Process states that are terminal failures.
 _V2_REJECTED_STATES = ("REJECTED", "DECLINED", "FAILED", "EXPIRED")

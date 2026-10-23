@@ -795,6 +795,13 @@ def test_approval_succeeds_on_each_recognized_state(state):
     tr.await_web_login_approval(timeout_s=5, interval_s=0)  # must not raise
 
 
+@pytest.mark.parametrize("state", ["CONFIRMED", "COMPLETED"])
+def test_approval_accepts_the_states_upstream_reports_under_status(state):
+    tr = _v2_api(get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"status": state}))
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)  # must not raise
+
+
 def test_approval_succeeds_via_the_tr_session_cookie_fallback():
     tr = _v2_api(get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "PENDING"}))
     tr.initiate_weblogin()
