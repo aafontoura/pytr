@@ -389,11 +389,14 @@ class TradeRepublicApi:
                     "Run `playwright install chromium` to download it. "
                     "Alternatively, use --v2 which does not require a WAF token."
                 ) from None
-            self.log.error(
-                "Failed to get AWS WAF token. If Chromium cannot start its sandbox "
-                "(for example as root in a container), set PYTR_ALLOW_NO_SANDBOX=1 "
-                "to launch it without the sandbox."
-            )
+            if "sandbox" in str(e).lower():
+                self.log.error(
+                    "Failed to get AWS WAF token. Chromium could not start its sandbox "
+                    "(for example as root in a container); set PYTR_ALLOW_NO_SANDBOX=1 "
+                    "to launch it without the sandbox."
+                )
+            else:
+                self.log.error("Failed to get AWS WAF token.")
             raise
 
         if not token:

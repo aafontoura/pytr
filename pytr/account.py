@@ -31,7 +31,7 @@ def print_accounts(tr):
     return "\n".join("  ".join(f"{cell:<{width}}" for cell, width in zip(row, widths)).rstrip() for row in all_rows)
 
 
-def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwright", v2=False, account=None):
+def login(phone_no=None, pin=None, store_credentials=False, waf_token="default", v2=False, account=None):
     """
     Handle credentials parameters and store to credentials file if requested.
     If no parameters are set but are needed then ask for input

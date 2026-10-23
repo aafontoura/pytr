@@ -1323,7 +1323,7 @@ def test_unconfirmed_handshake_is_closed_and_not_kept(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _fake_playwright(monkeypatch, launches):
+def _fake_playwright(monkeypatch, launches, launch_error=None):
     class _Page:
         def goto(self, url, **kwargs):
             pass
@@ -1345,6 +1345,8 @@ def _fake_playwright(monkeypatch, launches):
     class _Chromium:
         def launch(self, **kwargs):
             launches.append(kwargs)
+            if launch_error is not None:
+                raise launch_error
             return _Browser()
 
     class _Playwright:
@@ -1441,3 +1443,51 @@ def test_approval_reads_the_status_key_before_the_state_key():
     tr.initiate_weblogin()
     with pytest.raises(TimeoutError):
         tr.await_web_login_approval(timeout_s=0.05, interval_s=0)
+
+
+def test_playwright_sandbox_start_up_failure_names_the_opt_in(monkeypatch, caplog):
+    sandbox_error = RuntimeError("Running as root without --no-sandbox is not supported.")
+    _fake_playwright(monkeypatch, [], launch_error=sandbox_error)
+    monkeypatch.delenv("PYTR_ALLOW_NO_SANDBOX", raising=False)
+    with _capture_logger(caplog, "api"):
+        with pytest.raises(RuntimeError):
+            _api()._fetch_waf_token_playwright()
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "PYTR_ALLOW_NO_SANDBOX=1" in logged
+
+
+def test_playwright_other_failures_get_no_sandbox_hint(monkeypatch, caplog):
+    _fake_playwright(monkeypatch, [], launch_error=RuntimeError("Target page, context or browser has been closed."))
+    monkeypatch.delenv("PYTR_ALLOW_NO_SANDBOX", raising=False)
+    with _capture_logger(caplog, "api"):
+        with pytest.raises(RuntimeError):
+            _api()._fetch_waf_token_playwright()
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "Failed to get AWS WAF token." in logged
+    assert "PYTR_ALLOW_NO_SANDBOX" not in logged
+
+
+def test_v2_login_with_the_default_waf_setting_never_fetches_a_playwright_token(monkeypatch, pytr_home):
+    from pytr import account as account_mod
+
+    fetched = []
+    monkeypatch.setattr(
+        pytr.api.TradeRepublicApi,
+        "_fetch_waf_token_playwright",
+        lambda self, timeout_ms=30000: fetched.append(timeout_ms),
+    )
+
+    def stubbed_client(**kwargs):
+        tr = pytr.api.TradeRepublicApi(**kwargs)
+        tr._websession.post = lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse()
+        tr._websession.get = lambda url, headers=None, timeout=None: _FakePollResponse(payload={"status": "CONFIRMED"})
+        tr._websession.request = lambda method, url, data=None, headers=None, timeout=None: _FakePollResponse(
+            payload={}
+        )
+        return tr
+
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", stubbed_client)
+    tr = account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+    assert isinstance(tr, pytr.api.TradeRepublicApi)
+    assert fetched == []
+    assert not pytr_home.exists()
