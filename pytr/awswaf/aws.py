@@ -29,6 +29,7 @@ import re
 
 from curl_cffi import requests
 
+from ..api import DEFAULT_NETWORK_TIMEOUT
 from .fingerprint import get_fp
 from .verify import CHALLENGE_SOLVERS
 
@@ -130,7 +131,9 @@ class AwsWaf:
         self._js_config = parse_challenge_js(challenge_js_text)
 
     def get_inputs(self):
-        return self.session.get(f"https://{self.endpoint}/inputs?client=browser").json()
+        return self.session.get(
+            f"https://{self.endpoint}/inputs?client=browser", timeout=DEFAULT_NETWORK_TIMEOUT
+        ).json()
 
     def build_payload(self, inputs: dict):
         challenge_type = inputs["challenge_type"]
@@ -229,10 +232,13 @@ class AwsWaf:
                     metadata_field: (None, json.dumps(payload)),
                 },
                 headers={"user-agent": self.user_agent},
+                timeout=DEFAULT_NETWORK_TIMEOUT,
             ).json()
         else:
             self.session.headers["content-type"] = "text/plain;charset=UTF-8"
-            res = self.session.post(f"https://{self.endpoint}/verify", json=payload).json()
+            res = self.session.post(
+                f"https://{self.endpoint}/verify", json=payload, timeout=DEFAULT_NETWORK_TIMEOUT
+            ).json()
 
         return res["token"]
 

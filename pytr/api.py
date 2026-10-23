@@ -198,6 +198,7 @@ class TradeRepublicApi:
     _required_action = None
     _device_info = None
     _process_expires_at = 0
+    _tr_session_at_initiate = None
     _session_expires_at = 0
 
     _ws = None
@@ -553,6 +554,7 @@ class TradeRepublicApi:
         # D-B: remember the server-side expiry so it can only shorten the
         # approval poll window, never extend it (0 = the server did not say).
         self._process_expires_at = self._weblogin_deadline(process) if process.get("expiresAt") else 0
+        self._tr_session_at_initiate = self._tr_session_cookie()
         # v2 does not always send countdownInSeconds; the web frontend falls back to 120s.
         return int(j.get("countdownInSeconds", 120)) + 1
 
@@ -692,16 +694,20 @@ class TradeRepublicApi:
                 raise ValueError(f"Login process {state.lower()}.")
             if self._weblogin_expired(process):
                 raise TimeoutError("The login request expired before approval.")
-            # State unknown but session cookie present? Treat as approved.
-            # Safe only because the jar starts empty for a fresh client
-            # (save_cookies=False and resume_websession() never called).
-            for c in self._websession.cookies or ():
-                if c.name == "tr_session" and c.value:
-                    self.save_websession()
-                    self.log.info("Session cookie detected, login complete.")
-                    return
+            # State unknown: a tr_session cookie issued after initiate means the session was granted.
+            tr_session = self._tr_session_cookie()
+            if tr_session is not None and tr_session != self._tr_session_at_initiate:
+                self.save_websession()
+                self.log.info("Session cookie detected, login complete.")
+                return
             time.sleep(interval)
         raise TimeoutError("Push approval not received within timeout.")
+
+    def _tr_session_cookie(self):
+        for c in self._websession.cookies or ():
+            if c.name == "tr_session" and c.value:
+                return c.value
+        return None
 
     def save_websession(self):
         if self._save_cookies:
@@ -863,15 +869,22 @@ class TradeRepublicApi:
         }
         connect_id = 31
 
-        self._ws = await websockets.connect(
-            "wss://api.traderepublic.com", ssl=ssl_context, additional_headers=extra_headers
+        ws = await websockets.connect(
+            "wss://api.traderepublic.com",
+            ssl=ssl_context,
+            additional_headers=extra_headers,
+            open_timeout=DEFAULT_NETWORK_TIMEOUT,
         )
-        await self._ws.send(f"connect {connect_id} {json.dumps(connection_message)}")
-        response = await self._ws.recv()
+        try:
+            await ws.send(f"connect {connect_id} {json.dumps(connection_message)}")
+            response = await asyncio.wait_for(ws.recv(), DEFAULT_NETWORK_TIMEOUT)
+            if not response == "connected":
+                raise ValueError("Connection Error: the websocket did not confirm the connection.")
+        except BaseException:
+            await ws.close()
+            raise
 
-        if not response == "connected":
-            raise ValueError("Connection Error: the websocket did not confirm the connection.")
-
+        self._ws = ws
         self.log.info("Connected.")
 
         return self._ws
@@ -966,8 +979,8 @@ class TradeRepublicApi:
         previous_response = self._previous_responses[subscription_id]
         i, result = 0, []
         for diff in delta_payload.split("\t"):
-            # P-5/L1: a malformed segment (empty, or non-numeric length) from a
-            # hostile/buggy backend raises a typed error instead of an arbitrary one.
+            # P-5/L1: a malformed segment (unknown sign, or non-numeric or out-of-range length) from a
+            # hostile/buggy backend raises a typed error instead of an arbitrary one. Empty segments are skipped.
             if not diff:
                 continue
             sign = diff[0]
@@ -983,6 +996,8 @@ class TradeRepublicApi:
                 if sign == "=":
                     result.append(previous_response[i : i + length])
                 i += length
+            else:
+                raise MalformedDeltaError("Malformed delta segment")
         return "".join(result)
 
     async def _recv_subscription(self, subscription_id):

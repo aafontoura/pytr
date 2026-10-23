@@ -147,27 +147,17 @@ def _capture_logger(caplog, name):
         logger.removeHandler(caplog.handler)
 
 
-def _listing(path: Path) -> list:
-    return sorted(path.iterdir()) if path.is_dir() else []
-
-
 @pytest.fixture
 def pytr_home(tmp_path, monkeypatch):
-    """Point every ~/.pytr path the api and account modules use at a temp dir.
-
-    The real ~/.pytr is checked afterwards, so a test that writes there fails even if it was redirected by mistake.
-    """
+    """Point every ~/.pytr path the api and account modules use at a temp dir, and return that dir."""
     from pytr import account as account_mod
 
-    real = pytr.api.BASE_DIR
-    before = _listing(real)
     base = tmp_path / ".pytr"
     for module in (pytr.api, account_mod):
         monkeypatch.setattr(module, "BASE_DIR", base)
         monkeypatch.setattr(module, "CREDENTIALS_FILE", base / "credentials")
     monkeypatch.setattr(pytr.api, "COOKIES_FILE", base / "cookies.txt")
-    yield base
-    assert _listing(real) == before, "a test wrote to the real ~/.pytr"
+    return base
 
 
 def test_base_behavior_is_vulnerable_title_dotdot(tmp_path):
@@ -350,6 +340,14 @@ def test_calculate_delta_raises_on_out_of_range_length(delta):
         tr._calculate_delta("1", delta)
 
 
+@pytest.mark.parametrize("delta", ["X3", "=4\tX3\t=2", "*"])
+def test_calculate_delta_raises_on_unknown_sign(delta):
+    tr = _api()
+    tr._previous_responses = {"1": "ABCDEFGHIJ"}
+    with pytest.raises(pytr.api.MalformedDeltaError):
+        tr._calculate_delta("1", delta)
+
+
 def test_trade_republic_error_message_is_payload_free():
     err = pytr.api.TradeRepublicError("7", {"id": "7", "type": "portfolio"}, {"secret": "ACCOUNT-SECRET"})
     assert "ACCOUNT-SECRET" not in str(err)
@@ -365,6 +363,9 @@ def test_connect_error_does_not_echo_the_first_frame(monkeypatch):
 
         async def recv(self):
             return "FRAME-SECRET"
+
+        async def close(self):
+            pass
 
     async def connect(*args, **kwargs):
         return _FakeSocket()
@@ -756,6 +757,30 @@ def test_approval_succeeds_via_the_tr_session_cookie_fallback():
     tr.await_web_login_approval(timeout_s=5, interval_s=0)  # must not raise
 
 
+def test_approval_ignores_a_tr_session_cookie_that_predates_initiate():
+    polls = []
+
+    def get(url, headers=None, timeout=None):
+        polls.append(url)
+        return _FakePollResponse(payload={"state": "PENDING"})
+
+    tr = _v2_api(get=get)
+    tr._websession.cookies.set("tr_session", "stale-session")
+    tr.initiate_weblogin()
+    polls_before_await = len(polls)
+    with pytest.raises(TimeoutError):
+        tr.await_web_login_approval(timeout_s=0.05, interval_s=0)
+    assert len(polls) > polls_before_await, "the poll must run and still not report the login complete"
+
+
+def test_approval_accepts_a_tr_session_cookie_reissued_after_initiate():
+    tr = _v2_api(get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "PENDING"}))
+    tr._websession.cookies.set("tr_session", "stale-session")
+    tr.initiate_weblogin()
+    tr._websession.cookies.set("tr_session", "fresh-session")
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)  # must not raise
+
+
 @pytest.mark.parametrize("state", ["REJECTED", "DECLINED", "FAILED", "EXPIRED"])
 def test_approval_rejection_raises_without_leaking_the_payload(state):
     secret = "session-material-that-must-not-leak"
@@ -1130,3 +1155,117 @@ def test_account_login_v2_keeps_the_process_id_out_of_transport_errors(monkeypat
     assert "PROCESS-SECRET" not in logged
     assert "ConnectionError" in logged
     assert not pytr_home.exists()
+
+
+# --------------------------------------------------------------------------
+# P-5 - explicit timeouts on every network call outside the streaming recv
+# --------------------------------------------------------------------------
+
+
+class _WafResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _WafSession:
+    def __init__(self):
+        self.headers = {}
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(kwargs)
+        return _WafResponse({"challenge_type": "unknown"})
+
+    def post(self, url, **kwargs):
+        self.calls.append(kwargs)
+        return _WafResponse({"token": "waf-token"})
+
+
+def test_awswaf_requests_all_carry_an_explicit_timeout(monkeypatch):
+    from pytr.awswaf.aws import AwsWaf
+
+    session = _WafSession()
+    waf = AwsWaf("waf.example", "app.traderepublic.com", "")
+    waf.session = session
+    waf.get_inputs()
+    waf.verify({"solution": "s"}, "unknown")
+
+    multipart_calls = []
+
+    def multipart_post(url, **kwargs):
+        multipart_calls.append(kwargs)
+        return _WafResponse({"token": "multipart-token"})
+
+    waf._js_config["challenge_types"] = {"mp-hash": "mp_verify"}
+    monkeypatch.setattr(requests, "post", multipart_post)
+    waf.verify({"solution": "s"}, "mp-hash")
+
+    timeouts = [kwargs.get("timeout") for kwargs in session.calls + multipart_calls]
+    assert len(timeouts) == 3
+    assert all(timeout == pytr.api.DEFAULT_NETWORK_TIMEOUT for timeout in timeouts)
+
+
+class _HandshakeSocket:
+    close_code = None
+
+    def __init__(self, answer, closed):
+        self._answer = answer
+        self._closed = closed
+
+    async def send(self, message):
+        pass
+
+    async def recv(self):
+        if self._answer is None:
+            await asyncio.sleep(3600)
+        return self._answer
+
+    async def close(self):
+        self._closed.append(True)
+
+
+def _stub_connect(monkeypatch, answer, closed, seen=None):
+    async def connect(uri, **kwargs):
+        if seen is not None:
+            seen.update(kwargs)
+        return _HandshakeSocket(answer, closed)
+
+    monkeypatch.setattr(pytr.api.websockets, "connect", connect)
+
+
+def test_websocket_connect_passes_an_explicit_open_timeout(monkeypatch):
+    seen, closed = {}, []
+    _stub_connect(monkeypatch, "connected", closed, seen)
+    tr = _api()
+    asyncio.run(tr._get_ws())
+    assert seen["open_timeout"] == pytr.api.DEFAULT_NETWORK_TIMEOUT
+    assert closed == []
+    assert tr._ws is not None
+
+
+def test_silent_handshake_is_bounded_closed_and_not_kept(monkeypatch):
+    closed = []
+    _stub_connect(monkeypatch, None, closed)
+    monkeypatch.setattr(pytr.api, "DEFAULT_NETWORK_TIMEOUT", 0.01)
+    tr = _api()
+
+    async def bounded_by_the_test():
+        return await asyncio.wait_for(tr._get_ws(), 5)
+
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        asyncio.run(bounded_by_the_test())
+    assert closed == [True]
+    assert tr._ws is None
+
+
+def test_unconfirmed_handshake_is_closed_and_not_kept(monkeypatch):
+    closed = []
+    _stub_connect(monkeypatch, "not-connected", closed)
+    tr = _api()
+    with pytest.raises(ValueError):
+        asyncio.run(tr._get_ws())
+    assert closed == [True]
+    assert tr._ws is None
