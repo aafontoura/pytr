@@ -892,6 +892,9 @@ class TradeRepublicApi:
     async def subscribe(self, payload):
         if isinstance(payload, dict) and payload.get("type") in _MUTATION_SUBSCRIPTION_TYPES:
             self._guard_read_only()
+        return await self._send_subscription(payload)
+
+    async def _send_subscription(self, payload):
         subscription_id = await self._next_subscription_id()
         ws = await self._get_ws()
         # P-4: log only the subscription type, not the full payload.
@@ -1287,7 +1290,7 @@ class TradeRepublicApi:
         return await self.subscribe({"type": "savingsPlans"})
 
     async def savings_plan_parameters(self, isin):
-        return await self.subscribe({"type": "cancelSavingsPlan", "instrumentId": isin})
+        return await self._send_subscription({"type": "cancelSavingsPlan", "instrumentId": isin})
 
     async def create_savings_plan(
         self,

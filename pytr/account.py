@@ -7,7 +7,7 @@ import requests
 from pygments import formatters, highlight, lexers
 
 from .api import BASE_DIR, CREDENTIALS_FILE, TradeRepublicApi, account_kind, account_name
-from .security import assert_safe_to_read, secure_dir, secure_write_text
+from .security import assert_safe_to_read, secure_write_text
 from .utils import get_logger
 
 
@@ -63,7 +63,6 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
         pin_masked = len(pin) * "*"
         log.info(f"Using credentials from file {CREDENTIALS_FILE}. Phone: {phone_no_masked}, PIN: {pin_masked}")
     else:
-        secure_dir(BASE_DIR)
         if phone_no is None:
             print("Please enter your TradeRepublic phone number in the format +4912345678:")
             phone_no = input()

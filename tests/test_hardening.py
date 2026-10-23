@@ -147,13 +147,27 @@ def _capture_logger(caplog, name):
         logger.removeHandler(caplog.handler)
 
 
-def _redirect_pytr_home(tmp_path, monkeypatch) -> Path:
-    """Point every ~/.pytr path the api module uses at a temp dir, and return that dir."""
+def _listing(path: Path) -> list:
+    return sorted(path.iterdir()) if path.is_dir() else []
+
+
+@pytest.fixture
+def pytr_home(tmp_path, monkeypatch):
+    """Point every ~/.pytr path the api and account modules use at a temp dir.
+
+    The real ~/.pytr is checked afterwards, so a test that writes there fails even if it was redirected by mistake.
+    """
+    from pytr import account as account_mod
+
+    real = pytr.api.BASE_DIR
+    before = _listing(real)
     base = tmp_path / ".pytr"
-    monkeypatch.setattr(pytr.api, "BASE_DIR", base)
-    monkeypatch.setattr(pytr.api, "CREDENTIALS_FILE", base / "credentials")
+    for module in (pytr.api, account_mod):
+        monkeypatch.setattr(module, "BASE_DIR", base)
+        monkeypatch.setattr(module, "CREDENTIALS_FILE", base / "credentials")
     monkeypatch.setattr(pytr.api, "COOKIES_FILE", base / "cookies.txt")
-    return base
+    yield base
+    assert _listing(real) == before, "a test wrote to the real ~/.pytr"
 
 
 def test_base_behavior_is_vulnerable_title_dotdot(tmp_path):
@@ -394,6 +408,7 @@ SYNC_MUTATIONS = [
 @pytest.mark.parametrize("method,args", ASYNC_MUTATIONS)
 def test_async_mutation_blocked_in_read_only(method, args):
     tr = pytr.api.TradeRepublicApi(phone_no="+490000000000", pin="0000", read_only=True)
+    tr._get_ws = _socket_must_not_open
     with pytest.raises(pytr.api.ReadOnlyError):
         asyncio.run(getattr(tr, method)(*args))
 
@@ -441,7 +456,7 @@ def test_read_only_subscribe_blocks_mutation_types_before_any_io(payload_type):
         tr.blocking_subscribe({"type": payload_type})
 
 
-def test_read_only_subscribe_still_sends_read_subscriptions():
+def _read_only_api_with_recorded_socket():
     tr = pytr.api.TradeRepublicApi(phone_no="+490000000000", pin="0000", read_only=True)
     sent = []
 
@@ -453,8 +468,19 @@ def test_read_only_subscribe_still_sends_read_subscriptions():
         return _FakeSocket()
 
     tr._get_ws = get_ws
+    return tr, sent
+
+
+def test_read_only_subscribe_still_sends_read_subscriptions():
+    tr, sent = _read_only_api_with_recorded_socket()
     subscription_id = asyncio.run(tr.subscribe({"type": "timeline", "after": None}))
     assert sent == [f"sub {subscription_id} " + json.dumps({"type": "timeline", "after": None})]
+
+
+def test_read_only_savings_plan_parameters_is_still_a_read():
+    tr, sent = _read_only_api_with_recorded_socket()
+    subscription_id = asyncio.run(tr.savings_plan_parameters("DE000"))
+    assert sent == [f"sub {subscription_id} " + json.dumps({"type": "cancelSavingsPlan", "instrumentId": "DE000"})]
 
 
 # --------------------------------------------------------------------------
@@ -637,9 +663,8 @@ def test_v2_waf_token_travels_as_cookie_and_never_as_plain_header():
     assert jar.get("aws-waf-token") == "waf-token-value"
 
 
-def test_device_id_is_stable_and_never_persisted(tmp_path, monkeypatch):
+def test_device_id_is_stable_and_never_persisted(pytr_home):
     """D-A option 1: upstream's stable, never-persisted device identity."""
-    base = _redirect_pytr_home(tmp_path, monkeypatch)
     a, b = _v2_api(), _v2_api()
     assert a._stable_device_id() == b._stable_device_id()
     assert re.fullmatch(r"[0-9a-f]{128}", a._stable_device_id())
@@ -647,18 +672,16 @@ def test_device_id_is_stable_and_never_persisted(tmp_path, monkeypatch):
     device_info = a._login_headers()["X-TR-Device-Info"]
     decoded = json.loads(base64.b64decode(device_info))
     assert decoded["stableDeviceId"] == a._stable_device_id()
-    assert not base.exists(), "device identity must not write to disk"
+    assert not pytr_home.exists(), "device identity must not write to disk"
 
 
-def test_v2_login_never_touches_the_pytr_home_directory(tmp_path, monkeypatch):
+def test_v2_login_never_touches_the_pytr_home_directory(pytr_home):
     """R-104: no ~/.pytr is created or read on the v2 path."""
-    base = _redirect_pytr_home(tmp_path, monkeypatch)
-
     tr = _v2_api(get=lambda url, headers=None, timeout=None: _FakePollResponse(payload={"state": "APPROVED"}))
     tr.initiate_weblogin()
     tr.await_web_login_approval(timeout_s=5, interval_s=0)
 
-    assert not base.exists(), "the v2 path wrote under ~/.pytr"
+    assert not pytr_home.exists(), "the v2 path wrote under ~/.pytr"
 
 
 # --- PIN release and the initiate/await split ----------------------------
@@ -908,7 +931,7 @@ def test_v2_login_does_not_print_to_stdout(capsys):
 # --- the account.login(v2=True) regression for the P-8.1 split -----------
 
 
-def test_account_login_v2_drives_initiate_then_await_then_complete(monkeypatch):
+def test_account_login_v2_drives_initiate_then_await_then_complete(monkeypatch, pytr_home):
     """Without the explicit await_web_login_approval() call, account.login(v2=True)
     would report "Logged in." with no session (P-8.1)."""
     from pytr import account as account_mod
@@ -936,9 +959,10 @@ def test_account_login_v2_drives_initiate_then_await_then_complete(monkeypatch):
     account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
 
     assert calls == ["initiate", "await", "complete:''"]
+    assert not pytr_home.exists()
 
 
-def test_account_login_v2_exits_when_approval_never_granted(monkeypatch):
+def test_account_login_v2_exits_when_approval_never_granted(monkeypatch, pytr_home):
     from pytr import account as account_mod
 
     completed = []
@@ -963,9 +987,10 @@ def test_account_login_v2_exits_when_approval_never_granted(monkeypatch):
     with pytest.raises(SystemExit):
         account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
     assert completed == [], "login must not report success without an approval"
+    assert not pytr_home.exists()
 
 
-def test_account_login_v2_exits_with_the_totp_stage_error(monkeypatch):
+def test_account_login_v2_exits_with_the_totp_stage_error(monkeypatch, pytr_home):
     """D-C: a TOTP account dies at the approval stage with its own message."""
     from pytr import account as account_mod
 
@@ -990,6 +1015,40 @@ def test_account_login_v2_exits_with_the_totp_stage_error(monkeypatch):
     monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FakeTr())
     with pytest.raises(SystemExit):
         account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+    assert not pytr_home.exists()
+
+
+def test_account_login_explicit_pin_without_store_leaves_pytr_home_untouched(monkeypatch, pytr_home):
+    """R-104: explicit phone and PIN without store_credentials neither create ~/.pytr nor save cookies."""
+    from pytr import account as account_mod
+
+    class _FakeTr:
+        def resume_websession(self):
+            return False
+
+        def initiate_weblogin(self):
+            return 121
+
+        def await_web_login_approval(self):
+            pass
+
+        def complete_weblogin(self, code):
+            pass
+
+        def settings(self):
+            return {}
+
+    constructed = []
+
+    def factory(**kwargs):
+        constructed.append(kwargs)
+        return _FakeTr()
+
+    monkeypatch.setattr(account_mod, "TradeRepublicApi", factory)
+    account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
+
+    assert constructed[0]["save_cookies"] is False
+    assert not pytr_home.exists()
 
 
 class _FrameProbeTr:
@@ -1016,29 +1075,29 @@ class _FrameProbeTr:
         return {}
 
 
-def test_login_frame_drops_the_pin_once_the_client_is_built(monkeypatch):
+def test_login_frame_drops_the_pin_once_the_client_is_built(monkeypatch, pytr_home):
     from pytr import account as account_mod
 
     held = []
     monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FrameProbeTr(held))
     account_mod.login(phone_no="+490000000000", pin=PIN, v2=True)
     assert held == [False]
+    assert not pytr_home.exists()
 
 
-def test_login_frame_drops_the_credentials_file_pin_once_the_client_is_built(tmp_path, monkeypatch):
+def test_login_frame_drops_the_credentials_file_pin_once_the_client_is_built(monkeypatch, pytr_home):
     from pytr import account as account_mod
 
-    credentials = tmp_path / "credentials"
-    secure_write_text(credentials, f"+490000000000\n{PIN}\n")
-    monkeypatch.setattr(account_mod, "CREDENTIALS_FILE", credentials)
+    secure_write_text(pytr_home / "credentials", f"+490000000000\n{PIN}\n")
     held = []
     monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _FrameProbeTr(held))
     account_mod.login(v2=True)
     assert held == [False]
+    assert sorted(p.name for p in pytr_home.iterdir()) == ["credentials"]
 
 
 @pytest.mark.parametrize("stage", ["initiate", "await"])
-def test_account_login_v2_keeps_the_process_id_out_of_transport_errors(monkeypatch, caplog, stage):
+def test_account_login_v2_keeps_the_process_id_out_of_transport_errors(monkeypatch, caplog, pytr_home, stage):
     from pytr import account as account_mod
 
     transport_error = requests.exceptions.ConnectionError(
@@ -1070,3 +1129,4 @@ def test_account_login_v2_keeps_the_process_id_out_of_transport_errors(monkeypat
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "PROCESS-SECRET" not in logged
     assert "ConnectionError" in logged
+    assert not pytr_home.exists()
