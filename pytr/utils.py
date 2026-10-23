@@ -7,6 +7,8 @@ import coloredlogs  # type: ignore[import-untyped]
 import requests
 from packaging import version
 
+from .security import secure_prepare_file
+
 log_level = None
 debug_logfile_handler = None
 debug_log_filter = None
@@ -31,6 +33,9 @@ def get_logger(name=__name__, verbosity=None, debug_file=None, debug_filter=None
     if debug_file is not None:
         print(f"Setting up debug logfile {debug_file}")
         if debug_logfile_handler is None:
+            # P-1/P-4: create the debug log file with 0600 perms before the
+            # FileHandler opens it, and reject symlinks.
+            secure_prepare_file(debug_file)
             debug_logfile_handler = logging.FileHandler(debug_file)
             debug_logfile_handler.setLevel(logging.DEBUG)
             debug_logfile_handler.setFormatter(

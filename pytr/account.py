@@ -1,5 +1,4 @@
 import json
-import os
 import sys
 import time
 from getpass import getpass
@@ -8,6 +7,7 @@ import requests
 from pygments import formatters, highlight, lexers
 
 from .api import BASE_DIR, CREDENTIALS_FILE, TradeRepublicApi, account_kind, account_name
+from .security import assert_safe_to_read, secure_dir, secure_write_text
 from .utils import get_logger
 
 
@@ -53,6 +53,8 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
     save_cookies = True
 
     if phone_no is None and CREDENTIALS_FILE.is_file():
+        # P-1: fail closed on a symlinked or group/other-readable credential file.
+        assert_safe_to_read(CREDENTIALS_FILE)
         with open(CREDENTIALS_FILE) as f:
             lines = f.readlines()
         phone_no = lines[0].strip()
@@ -61,7 +63,7 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
         pin_masked = len(pin) * "*"
         log.info(f"Using credentials from file {CREDENTIALS_FILE}. Phone: {phone_no_masked}, PIN: {pin_masked}")
     else:
-        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        secure_dir(BASE_DIR)
         if phone_no is None:
             print("Please enter your TradeRepublic phone number in the format +4912345678:")
             phone_no = input()
@@ -71,9 +73,10 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
             pin = getpass(prompt="Pin (Input is hidden):")
 
         if store_credentials:
-            with open(CREDENTIALS_FILE, "w") as f:
-                f.writelines([phone_no + "\n", pin + "\n"])
-            os.chmod(CREDENTIALS_FILE, 0o600)
+            # P-1: write credentials with 0600 perms, failing closed on symlinks.
+            # (Subsumes upstream's post-write os.chmod, which raced and skipped
+            # the directory and symlink checks.)
+            secure_write_text(CREDENTIALS_FILE, f"{phone_no}\n{pin}\n")
 
             log.info(f"Storing credentials/cookies in {BASE_DIR}")
         else:
