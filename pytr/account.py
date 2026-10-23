@@ -91,14 +91,21 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
         except ValueError as e:
             log.fatal(str(e))
             sys.exit(1)
-        request_time = time.time()
         if v2:
-            if tr.weblogin_needs_authenticator:
-                code = input("Enter the code from your authenticator app: ")
-            else:
-                print(f"Confirm the login in your Trade Republic app. (Countdown: {countdown})")
-                code = None
+            # v2 push-approve flow (P-8.1). initiate_weblogin() only POSTs and
+            # probes; the approval wait is a separate operation, so this helper
+            # must drive it explicitly. Without this call complete_weblogin("")
+            # would report "Logged in." with no session. Accounts that need an
+            # authenticator app raise a distinct stage error here (D-C).
+            try:
+                tr.await_web_login_approval()
+            except (ValueError, TimeoutError) as e:
+                log.fatal(str(e))
+                sys.exit(1)
+            tr.complete_weblogin("")
+            log.info("Logged in.")
         else:
+            request_time = time.time()
             print("Enter the code you received to your mobile app as a notification.")
             print(f"Enter nothing if you want to receive the (same) code as SMS. (Countdown: {countdown})")
             code = input("Code: ")
@@ -113,8 +120,8 @@ def login(phone_no=None, pin=None, store_credentials=False, waf_token="playwrigh
                 print()
                 tr.resend_weblogin()
                 code = input("SMS requested. Enter the confirmation code:")
-        tr.complete_weblogin(code)
-        log.info("Logged in.")
+            tr.complete_weblogin(code)
+            log.info("Logged in.")
 
     # P-4: fetch the settings (also primes the securities account cache) but
     # never dump them to the logs (PII / financial data).

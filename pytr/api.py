@@ -104,6 +104,30 @@ ENV_APP_VERSION = "PYTR_TR_APP_VERSION"
 ENV_PLATFORM = "PYTR_TR_PLATFORM"
 ENV_USER_AGENT = "PYTR_TR_USER_AGENT"
 
+# P-8.3: how long await_web_login_approval() keeps polling, and how long it
+# sleeps between polls. This is a poll-*start* deadline (deliberately soft): a
+# GET issued just before it may still consume up to 2 x DEFAULT_NETWORK_TIMEOUT
+# (requests applies a scalar timeout to connect and read separately), so the
+# worst case is deadline + one full request. Callers that need a hard wall-clock
+# bound must impose it out of process. Denkeeper derives its parent timeout
+# (255s = 180 + 2x30 + 15) from this constant; changing it breaks that derivation.
+V2_APPROVAL_TIMEOUT = 180
+V2_APPROVAL_POLL_INTERVAL = 2.0
+
+#: Process states that mean the user approved the push in the TR app.
+_V2_APPROVED_STATES = ("CONFIRMED", "APPROVED", "COMPLETED", "SUCCESS", "OK", "DONE")
+#: Process states that are terminal failures.
+_V2_REJECTED_STATES = ("REJECTED", "DECLINED", "FAILED", "EXPIRED")
+
+#: D-C: the contract is fixed at push approval with no second secret, so an
+#: authenticator (TOTP) account cannot complete this flow. It must fail as its
+#: own stage instead of waiting for a code that can never arrive.
+_AUTHENTICATOR_REQUIRED_MESSAGE = "This account requires an authenticator app; not supported by the sync."
+
+
+class AuthenticatorRequiredError(ValueError):
+    """Raised when the login needs an authenticator-app code this flow cannot supply (D-C)."""
+
 
 # Seconds after which the web session is refreshed.
 SESSION_REFRESH_INTERVAL = 290
@@ -153,6 +177,7 @@ class TradeRepublicApi:
     _process_id = None
     _required_action = None
     _device_info = None
+    _process_expires_at = 0
     _session_expires_at = 0
 
     _ws = None
@@ -488,24 +513,55 @@ class TradeRepublicApi:
         try:
             self._process_id = j["processId"]
         except KeyError:
-            err = j.get("errors")
-            if err:
-                raise ValueError(str(err))
-            else:
-                raise ValueError("processId not in reponse")
+            # P-8.4: surface the machine-readable errorCode only, never the
+            # response payload (it carries PII and session material).
+            code = None
+            try:
+                code = j["errors"][0]["errorCode"]
+            except (KeyError, IndexError, TypeError):
+                pass
+            if code:
+                raise ValueError(LOGIN_ERRORS.get(str(code), f"Login failed: {code}.")) from None
+            raise ValueError("processId not in response.") from None
         if not self._use_v2_login:
             return int(j["countdownInSeconds"]) + 1
         if self._process_id is None:
             raise ValueError("Trade Republic completed the login without a confirmation step.")
         # The second factor is on the login process, not in the login response.
-        self._required_action = self._get_weblogin_process(quiet=True).get("requiredAction")
+        process = self._get_weblogin_process(quiet=True)
+        self._required_action = process.get("requiredAction")
+        # D-B: remember the server-side expiry so it can only shorten the
+        # approval poll window, never extend it (0 = the server did not say).
+        self._process_expires_at = self._weblogin_deadline(process) if process.get("expiresAt") else 0
         # v2 does not always send countdownInSeconds; the web frontend falls back to 120s.
         return int(j.get("countdownInSeconds", 120)) + 1
 
     @property
     def weblogin_needs_authenticator(self):
-        """Whether complete_weblogin() needs a code from the user's authenticator app."""
+        """Whether the account needs a code from the user's authenticator app."""
         return self._required_action == "AUTHENTICATOR_VERIFICATION"
+
+    def await_web_login_approval(
+        self,
+        timeout_s: int = V2_APPROVAL_TIMEOUT,
+        interval_s: float = V2_APPROVAL_POLL_INTERVAL,
+    ):
+        """Block until the TR mobile-app push for this login process is approved.
+
+        Raises :class:`AuthenticatorRequiredError` when the account needs a
+        second secret (D-C), ``ValueError`` if the process was rejected or
+        expired, and ``TimeoutError`` if no verdict arrived before the poll
+        deadline.
+
+        P-8.1: the approval wait is a separate operation from
+        :meth:`initiate_weblogin`, so the PIN release (P-7) is strictly before
+        the up-to-180s poll and callers get the stage boundary they drive.
+        """
+        if self.weblogin_needs_authenticator:
+            raise AuthenticatorRequiredError(_AUTHENTICATOR_REQUIRED_MESSAGE)
+        if not self._process_id:
+            raise ValueError("Initiate web login first.")
+        self._await_weblogin_confirmation(interval=interval_s, timeout_s=timeout_s)
 
     def resend_weblogin(self):
         if self._use_v2_login:
@@ -534,18 +590,15 @@ class TradeRepublicApi:
             self.save_websession()
             return
 
+        # D-C: an authenticator (TOTP) account cannot complete this flow; there
+        # is no channel to deliver the second secret. Fail at the stage that
+        # would otherwise wait for a code that can never arrive.
         if self.weblogin_needs_authenticator:
-            if not verify_code:
-                raise ValueError("This account needs a code from your authenticator app.")
-            r = self._websession.post(
-                f"{self._host}/api/v2/auth/web/login/processes/{self._process_id}/authenticator-verification",
-                json={"code": verify_code},
-                headers=self._login_headers(),
-                timeout=DEFAULT_NETWORK_TIMEOUT,
-            )
-            self._raise_for_login_error(r)
-
-        self._await_weblogin_confirmation()
+            raise AuthenticatorRequiredError(_AUTHENTICATOR_REQUIRED_MESSAGE)
+        if verify_code:
+            raise ValueError("v2 web login uses push approval; no verify code is expected.")
+        # P-8.1: the approval already happened in await_web_login_approval();
+        # this is the post-poll session save and issues no request.
         self.save_websession()
 
     def _raise_for_login_error(self, r):
@@ -581,28 +634,54 @@ class TradeRepublicApi:
         except (TypeError, ValueError):
             return time.time() + fallback
 
-    def _await_weblogin_confirmation(self, interval=2):
-        """Poll the login process until confirmed in the Trade Republic mobile app."""
-        process = self._get_weblogin_process()
-        deadline = self._weblogin_deadline(process)
-        self.log.info("Waiting for you to confirm the login in the Trade Republic app...")
-        announced = 0.0
-        while True:
-            status = process.get("status")
-            self.log.debug(f"Login process status: {status}")
-            if status in ("CONFIRMED", "COMPLETED"):
+    def _clamp_approval_timeout(self, timeout_s):
+        """D-B: the server's expiresAt may only shorten the poll window, never extend it."""
+        if not self._process_expires_at:
+            return timeout_s
+        return max(0.0, min(float(timeout_s), self._process_expires_at - time.time()))
+
+    def _weblogin_expired(self, process):
+        """Whether the server-side expiry of this process has passed (D-B)."""
+        if not process.get("expiresAt"):
+            return False
+        # Unparseable expiry means unknown, not expired.
+        return self._weblogin_deadline(process, fallback=float("inf")) <= time.time()
+
+    def _await_weblogin_confirmation(self, interval=2, timeout_s=V2_APPROVAL_TIMEOUT):
+        """Poll the login process until confirmed in the Trade Republic mobile app.
+
+        P-8.3: the deadline is a poll-*start* deadline (deliberately soft): a GET
+        issued just before it may still run to completion afterwards. It is
+        measured on the monotonic clock (the wall clock jumps under NTP
+        adjustments) and clamped by the server's expiresAt, which may only
+        shorten the window, never extend it (D-B).
+        P-8.4: no response payload is ever interpolated into an exception or a
+        log record, only the state name and the HTTP status.
+        """
+        deadline = time.monotonic() + self._clamp_approval_timeout(timeout_s)
+        self.log.info("Approve the login in your Trade Republic mobile app (waiting up to %ss)...", timeout_s)
+        while time.monotonic() < deadline:
+            process = self._get_weblogin_process()
+            state = str(process.get("state") or process.get("status") or "").upper()
+            self.log.debug("Login process state: %s", state or "unknown")
+            if state in _V2_APPROVED_STATES:
+                self.save_websession()
                 self.log.info("Login confirmed.")
                 return
-            if status != "PENDING":
-                raise ValueError(f"Unexpected login process status: {status!r}")
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError("The login was not confirmed in time.")
-            if time.time() - announced >= 10:
-                self.log.info(f"Still waiting, {int(remaining)}s left...")
-                announced = time.time()
+            if state in _V2_REJECTED_STATES:
+                raise ValueError(f"Login process {state.lower()}.")
+            if self._weblogin_expired(process):
+                raise TimeoutError("The login request expired before approval.")
+            # State unknown but session cookie present? Treat as approved.
+            # Safe only because the jar starts empty for a fresh client
+            # (save_cookies=False and resume_websession() never called).
+            for c in self._websession.cookies or ():
+                if c.name == "tr_session" and c.value:
+                    self.save_websession()
+                    self.log.info("Session cookie detected, login complete.")
+                    return
             time.sleep(interval)
-            process = self._get_weblogin_process()
+        raise TimeoutError("Push approval not received within timeout.")
 
     def save_websession(self):
         if self._save_cookies:

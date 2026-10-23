@@ -17,6 +17,7 @@ from pytr.api import (
     ENV_USER_AGENT,
     USER_AGENT,
     WEB_PLATFORM,
+    AuthenticatorRequiredError,
     TradeRepublicApi,
 )
 
@@ -126,36 +127,40 @@ def test_initiate_weblogin_rejects_a_null_process_id():
 # --- complete_weblogin ---------------------------------------------------------------
 
 
-def test_complete_weblogin_posts_code_to_authenticator_verification():
-    tr = _api([{}, {"status": "CONFIRMED"}])
-    tr._process_id = "pid-1"
-    tr._required_action = "AUTHENTICATOR_VERIFICATION"
-
-    tr.complete_weblogin("123456")
-
-    call = tr._websession.calls[0]
-    assert call["method"] == "POST"
-    assert call["url"] == f"{PROCESS}/authenticator-verification"
-    assert call["json"] == {"code": "123456"}
-
-
-def test_complete_weblogin_requires_a_code_when_authenticator_is_needed():
+def test_complete_weblogin_refuses_authenticator_accounts():
+    """D-C: authenticator (TOTP) accounts are a distinct stage error - this flow
+    is fixed at push approval with no second secret, so it must fail instead of
+    sending (or waiting for) a code that can never arrive."""
     tr = _api([])
     tr._process_id = "pid-1"
     tr._required_action = "AUTHENTICATOR_VERIFICATION"
 
-    with pytest.raises(ValueError, match="authenticator app"):
-        tr.complete_weblogin(None)
+    with pytest.raises(AuthenticatorRequiredError, match="authenticator app"):
+        tr.complete_weblogin("123456")
+
+    assert tr._websession.calls == []
 
 
-def test_complete_weblogin_polls_the_process_for_in_app_confirmation():
-    tr = _api([{"status": "PENDING"}, {"status": "CONFIRMED"}])
+def test_await_approval_refuses_authenticator_accounts_before_polling():
+    tr = _api([])
+    tr._process_id = "pid-1"
+    tr._required_action = "AUTHENTICATOR_VERIFICATION"
+
+    with pytest.raises(AuthenticatorRequiredError, match="not supported"):
+        tr.await_web_login_approval(timeout_s=5, interval_s=0)
+
+    assert tr._websession.calls == []
+
+
+def test_complete_weblogin_empty_code_saves_without_requests():
+    """P-8.1: the v2 flow splits initiate / await / complete; complete_weblogin("")
+    is the post-poll session save and issues no request."""
+    tr = _api([])
     tr._process_id = "pid-1"
 
-    tr.complete_weblogin(None)
+    tr.complete_weblogin("")
 
-    assert [c["method"] for c in tr._websession.calls] == ["GET", "GET"]
-    assert set(_urls(tr)) == {PROCESS}
+    assert tr._websession.calls == []
 
 
 # --- login process state machine -----------------------------------------------------
@@ -225,24 +230,19 @@ REQUIRED_HEADERS = ("X-TR-Device-Info", "X-TR-App-Version", "X-Tr-Platform")
 
 
 def _every_login_call():
-    """Every v2 login call pytr makes: start, poll, authenticator verification."""
-    poll = _api([{"processId": "pid-1"}, {"status": "PENDING"}, {"status": "CONFIRMED"}])
-    poll.initiate_weblogin()
-    poll.complete_weblogin(None)
+    """Every v2 login call pytr makes: start, probe, and each approval poll."""
+    tr = _api([{"processId": "pid-1"}, {"status": "PENDING"}, {"status": "CONFIRMED"}])
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)
 
-    verify = _api([{}, {"status": "CONFIRMED"}])
-    verify._process_id = "pid-1"
-    verify._required_action = "AUTHENTICATOR_VERIFICATION"
-    verify.complete_weblogin("123456")
-
-    return poll._websession.calls + verify._websession.calls
+    return tr._websession.calls
 
 
 def test_every_v2_login_call_sends_the_required_headers():
     """Without them Trade Republic answers 400 MISSING_REQUIRED_HEADER."""
     calls = _every_login_call()
 
-    assert [c["url"] for c in calls] == [LOGIN, PROCESS, PROCESS, f"{PROCESS}/authenticator-verification", PROCESS]
+    assert [c["url"] for c in calls] == [LOGIN, PROCESS, PROCESS]
     for call in calls:
         for header in REQUIRED_HEADERS:
             assert call["headers"].get(header), f"{header} missing on {call['method']} {call['url']}"
