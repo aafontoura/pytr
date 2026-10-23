@@ -13,6 +13,7 @@ from typing import Any
 
 DIR_MODE = 0o700
 FILE_MODE = 0o600
+_POSIX_MODE_BITS = os.name != "nt"
 
 
 class InsecurePathError(RuntimeError):
@@ -71,7 +72,8 @@ def secure_prepare_file(path: Path) -> Path:
     handler) that does not set permissions itself.
     """
     path = Path(path)
-    secure_dir(path.parent)
+    if not path.parent.is_dir():
+        secure_dir(path.parent)
     _assert_not_symlink(path)
     if not path.exists():
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), FILE_MODE)
@@ -90,7 +92,7 @@ def assert_safe_to_read(path: Path) -> Path:
     if path.is_symlink():
         raise InsecurePathError(f"Refusing to read symlinked file: {path}")
     st = path.stat()
-    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+    if _POSIX_MODE_BITS and st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise InsecurePathError(f"Refusing to read file with unsafe permissions: {path} (mode {oct(st.st_mode)})")
     return path
 

@@ -43,6 +43,7 @@ from pytr.security import (
     redact,
     safe_fields,
     secure_dir,
+    secure_prepare_file,
     secure_write_text,
 )
 
@@ -548,7 +549,7 @@ def test_pin_is_sent_once_then_released():
     """AC-P7.1: the login POST carries the PIN, and the reference is dropped after."""
     sent = []
 
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         sent.append(json)
         return _FakeLoginResponse()
 
@@ -565,7 +566,7 @@ def test_pin_is_sent_once_then_released():
 def test_pin_released_even_when_login_post_raises():
     """A network failure must not leave the PIN resident on the client."""
 
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         raise ConnectionError("network down")
 
     tr = _login_api(post)
@@ -576,7 +577,7 @@ def test_pin_released_even_when_login_post_raises():
 
 def test_no_attribute_retains_the_pin_after_login():
     """After login, no attribute of the client object holds the PIN value."""
-    tr = _login_api(lambda url, json=None, timeout=None, headers=None: _FakeLoginResponse())
+    tr = _login_api(lambda url, json=None, timeout=None, headers=None, **kwargs: _FakeLoginResponse())
     tr.initiate_weblogin()
 
     leaks = [name for name, value in vars(tr).items() if value == PIN]
@@ -587,7 +588,7 @@ def test_second_initiate_weblogin_without_pin_raises():
     """Re-login on a consumed client fails loudly instead of POSTing a null pin."""
     calls = []
 
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         calls.append(json)
         return _FakeLoginResponse()
 
@@ -605,7 +606,7 @@ def test_resend_and_complete_weblogin_do_not_need_the_pin():
     """The rest of the login flow works off _process_id, not the PIN (P-7 safety)."""
     posted = []
 
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         posted.append(url)
         return _FakeLoginResponse()
 
@@ -664,7 +665,7 @@ def _v2_api(post=None, get=None, waf_token=None):
         read_only=True,
         use_v2_login=True,
     )
-    tr._websession.post = post or (lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse())
+    tr._websession.post = post or (lambda url, json=None, timeout=None, headers=None, **kwargs: _FakeV2LoginResponse())
     tr._websession.get = get or (lambda url, headers=None, timeout=None: _FakePollResponse(payload={}))
     return tr
 
@@ -676,7 +677,7 @@ def test_v2_headers_present_on_login_polls_and_account_reads():
     """Step 8: the required headers ride on the login calls and the account reads, not just the POST."""
     seen = []
 
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         seen.append(headers or {})
         return _FakeV2LoginResponse()
 
@@ -742,7 +743,7 @@ def test_v2_pin_released_immediately_after_the_post_not_after_approval():
 
 
 def test_v2_pin_released_even_when_the_post_raises():
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         raise ConnectionError("network down")
 
     tr = _v2_api(post=post)
@@ -754,7 +755,7 @@ def test_v2_pin_released_even_when_the_post_raises():
 def test_v2_second_initiate_weblogin_raises_without_posting():
     calls = []
 
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         calls.append(url)
         return _FakeV2LoginResponse()
 
@@ -912,7 +913,7 @@ def test_v2_post_probe_and_poll_all_pass_an_explicit_timeout():
     """D2: no `requests` call on the v2 path may use the infinite default."""
     timeouts = []
 
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         timeouts.append(timeout)
         return _FakeV2LoginResponse()
 
@@ -994,7 +995,7 @@ def test_no_secret_material_is_logged_across_a_full_v2_login(caplog, monkeypatch
     def stubbed_client(**kwargs):
         tr = pytr.api.TradeRepublicApi(**kwargs)
         tr._websession.cookies.set("tr_session", cookie_value)
-        tr._websession.post = lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse()
+        tr._websession.post = lambda url, json=None, timeout=None, headers=None, **kwargs: _FakeV2LoginResponse()
         tr._websession.get = lambda url, headers=None, timeout=None: _FakePollResponse(payload=process_payload)
         tr._websession.request = lambda method, url, data=None, headers=None, timeout=None: _FakePollResponse(
             payload={"name": settings_pii}
@@ -1415,7 +1416,9 @@ OUTDATED_APP_VERSION = {"errors": [{"errorCode": "CLIENT_VERSION_OUTDATED", "det
 
 
 def test_v2_login_post_error_is_mapped_and_keeps_the_status():
-    tr = _v2_api(post=lambda url, json=None, timeout=None, headers=None: _FakePollResponse(426, OUTDATED_APP_VERSION))
+    tr = _v2_api(
+        post=lambda url, json=None, timeout=None, headers=None, **kwargs: _FakePollResponse(426, OUTDATED_APP_VERSION)
+    )
     with pytest.raises(ValueError) as excinfo:
         tr.initiate_weblogin()
     message = str(excinfo.value)
@@ -1427,7 +1430,7 @@ def test_v2_login_post_error_is_mapped_and_keeps_the_status():
 def test_account_login_v2_logs_the_mapped_login_error_and_exits(monkeypatch, caplog, pytr_home):
     from pytr import account as account_mod
 
-    def post(url, json=None, timeout=None, headers=None):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
         return _FakePollResponse(426, OUTDATED_APP_VERSION)
 
     monkeypatch.setattr(account_mod, "TradeRepublicApi", lambda **kw: _v2_api(post=post))
@@ -1502,7 +1505,7 @@ def test_v2_login_with_the_default_waf_setting_never_fetches_a_playwright_token(
 
     def stubbed_client(**kwargs):
         tr = pytr.api.TradeRepublicApi(**kwargs)
-        tr._websession.post = lambda url, json=None, timeout=None, headers=None: _FakeV2LoginResponse()
+        tr._websession.post = lambda url, json=None, timeout=None, headers=None, **kwargs: _FakeV2LoginResponse()
         tr._websession.get = lambda url, headers=None, timeout=None: _FakePollResponse(payload={"status": "CONFIRMED"})
         tr._websession.request = lambda method, url, data=None, headers=None, timeout=None: _FakePollResponse(
             payload={}
@@ -1636,3 +1639,102 @@ def test_account_login_stops_when_the_saved_session_cannot_be_verified(monkeypat
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "Could not reach Trade Republic to verify the saved session." in logged
     assert initiated == [], "an unverifiable session must not start a fresh login"
+
+
+def test_assert_safe_to_read_skips_mode_bits_where_posix_modes_do_not_apply(tmp_path, monkeypatch):
+    f = tmp_path / "cookies"
+    f.write_text("x")
+    os.chmod(f, 0o644)
+    link = tmp_path / "link"
+    link.symlink_to(f)
+    monkeypatch.setattr("pytr.security._POSIX_MODE_BITS", False)
+    assert assert_safe_to_read(f) == f
+    with pytest.raises(InsecurePathError):
+        assert_safe_to_read(link)
+
+
+def test_secure_prepare_file_leaves_an_existing_parent_directory_alone(tmp_path):
+    parent = tmp_path / "project"
+    parent.mkdir()
+    os.chmod(parent, 0o755)
+    f = secure_prepare_file(parent / "debug.log")
+    assert stat.S_IMODE(os.stat(parent).st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(f).st_mode) == 0o600
+
+
+def test_secure_prepare_file_does_not_refuse_a_symlinked_parent(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    os.chmod(target, 0o755)
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    f = secure_prepare_file(link / "debug.log")
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(f).st_mode) == 0o600
+
+
+def test_secure_prepare_file_creates_a_missing_parent_0700(tmp_path):
+    f = secure_prepare_file(tmp_path / "new" / "cookies.txt")
+    assert stat.S_IMODE(os.stat(f.parent).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(f).st_mode) == 0o600
+
+
+def test_resume_returns_false_when_the_saved_jar_is_rejected(pytr_home):
+    tr = pytr.api.TradeRepublicApi(
+        phone_no="+490000000000",
+        pin=PIN,
+        waf_token=None,
+        save_cookies=True,
+        cookies_file=pytr_home / "cookies.txt",
+    )
+    os.chmod(pytr_home / "cookies.txt", 0o644)
+    assert tr.resume_websession() is False
+
+
+def _redirecting_post(seen, status=302):
+    def post(url, json=None, timeout=None, headers=None, **kwargs):
+        seen.append(kwargs)
+        return _FakePollResponse(status)
+
+    return post
+
+
+def test_login_post_is_not_followed_on_a_redirect():
+    seen = []
+    tr = _v2_api(post=_redirecting_post(seen))
+    with pytest.raises(requests.exceptions.HTTPError):
+        tr.initiate_weblogin()
+    assert seen[0]["allow_redirects"] is False
+
+
+def test_session_post_is_not_followed_on_a_redirect():
+    seen = []
+    tr = pytr.api.TradeRepublicApi(phone_no="+490000000000", pin="0000", waf_token=None)
+    tr._websession.post = _redirecting_post(seen)
+    with pytest.raises(requests.exceptions.HTTPError):
+        tr._post_session("subject-1")
+    assert seen[0]["allow_redirects"] is False
+
+
+def test_v1_verification_post_is_not_followed_on_a_redirect():
+    seen = []
+    tr = pytr.api.TradeRepublicApi(phone_no="+490000000000", pin="0000", waf_token=None)
+    tr._process_id = "proc-1"
+    tr._websession.post = _redirecting_post(seen)
+    with pytest.raises(requests.exceptions.HTTPError):
+        tr.complete_weblogin("1234")
+    assert seen[0]["allow_redirects"] is False
+
+
+def test_payout_confirmation_is_not_followed_on_a_redirect(monkeypatch):
+    seen = []
+
+    def request(method, url, data=None, headers=None, timeout=None, **kwargs):
+        seen.append(kwargs)
+        return _FakePollResponse(302)
+
+    monkeypatch.setattr(requests, "request", request)
+    tr = pytr.api.TradeRepublicApi(phone_no="+490000000000", pin="0000", waf_token=None)
+    with pytest.raises(ValueError):
+        tr.confirm_payout("proc-1", "1234")
+    assert seen[0]["allow_redirects"] is False

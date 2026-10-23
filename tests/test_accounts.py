@@ -68,7 +68,7 @@ class _Session:
         status, payload = reply if isinstance(reply, tuple) else (200, reply)
         return _Response(payload, status)
 
-    def post(self, url, json=None, headers=None, timeout=None):
+    def post(self, url, json=None, headers=None, timeout=None, **kwargs):
         return self._record("POST", url, json, headers, timeout)
 
     def get(self, url, headers=None, timeout=None):

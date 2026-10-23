@@ -42,7 +42,7 @@ import requests
 import websockets
 from curl_cffi import requests as cffi_requests
 
-from pytr.security import assert_safe_to_read, secure_dir, secure_prepare_file
+from pytr.security import InsecurePathError, assert_safe_to_read, secure_dir, secure_prepare_file
 from pytr.utils import get_logger
 
 # `playwright` and `pytr.awswaf` are imported lazily inside the two
@@ -481,6 +481,14 @@ class TradeRepublicApi:
             "Accept-Language": self._locale,
         }
 
+    def _post_credentials(self, url, **kwargs):
+        r = self._websession.post(url, allow_redirects=False, **kwargs)
+        if 300 <= r.status_code < 400:
+            raise requests.exceptions.HTTPError(
+                f"Trade Republic answered {r.status_code} with a redirect; not following it."
+            )
+        return r
+
     def initiate_weblogin(self):
         # P-7: the PIN is single-use. It is released as soon as the login POST
         # has been attempted, so a second initiate_weblogin() on the same client
@@ -517,7 +525,7 @@ class TradeRepublicApi:
         extra_headers = self._login_headers() if self._use_v2_login else None
         login_path = "/api/v2/auth/web/login" if self._use_v2_login else "/api/v1/auth/web/login"
         try:
-            r = self._websession.post(
+            r = self._post_credentials(
                 f"{self._host}{login_path}",
                 json={"phoneNumber": self.phone_no, "pin": self.pin},
                 headers=extra_headers,
@@ -623,7 +631,7 @@ class TradeRepublicApi:
             raise ValueError("Initiate web login first.")
 
         if not self._use_v2_login:
-            r = self._websession.post(
+            r = self._post_credentials(
                 f"{self._host}/api/v1/auth/web/login/{self._process_id}/{verify_code}",
                 timeout=DEFAULT_NETWORK_TIMEOUT,
             )
@@ -757,7 +765,7 @@ class TradeRepublicApi:
         # P-1: fail closed if the jar is a symlink or group/other-readable.
         try:
             assert_safe_to_read(self._cookies_file)
-        except OSError:
+        except (OSError, InsecurePathError):
             return False
 
         # Loads session cookies too (expirydate=0).
@@ -808,7 +816,7 @@ class TradeRepublicApi:
         """
         # P-6: swapping the session's acting account is a session-state mutation.
         self._guard_read_only()
-        return self._websession.post(
+        return self._post_credentials(
             f"{self._host}/api/v2/auth/web/session",
             json={"subjectId": subject_id},
             headers=self._login_headers(),
@@ -1431,6 +1439,7 @@ class TradeRepublicApi:
             url=f"{self._host}/api/v1/payout/{process_id}/code",
             data={"code": code},
             headers=self._default_headers,
+            allow_redirects=False,
             timeout=DEFAULT_NETWORK_TIMEOUT,
         )
 
