@@ -348,8 +348,9 @@ class TradeRepublicApi:
         # P-3: keep Chromium's sandbox ON by default. Disabling it is only
         # allowed via an explicit opt-in env var (e.g. for constrained CI),
         # never silently.
+        no_sandbox = os.environ.get("PYTR_ALLOW_NO_SANDBOX") == "1"
         launch_args: list[str] = []
-        if os.environ.get("PYTR_ALLOW_NO_SANDBOX") == "1":
+        if no_sandbox:
             self.log.warning("PYTR_ALLOW_NO_SANDBOX=1 set; launching Chromium WITHOUT its sandbox.")
             launch_args = ["--no-sandbox", "--disable-setuid-sandbox"]
 
@@ -357,6 +358,7 @@ class TradeRepublicApi:
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
+                    chromium_sandbox=not no_sandbox,
                     args=launch_args,
                 )
                 context = browser.new_context()
@@ -758,17 +760,20 @@ class TradeRepublicApi:
         return True
 
     def _web_request(self, url_path, payload=None, method="GET"):
+        headers = self._login_headers() if self._use_v2_login else None
         if self._session_expires_at < time.time():
             if self._subject_id is None:
                 # Refreshing without a subject returns the session to the login's own account.
                 # A new process starts here, so it never inherits the account an earlier run chose.
-                r = self._websession.get(f"{self._host}/api/v1/auth/web/session", timeout=DEFAULT_NETWORK_TIMEOUT)
+                r = self._websession.get(
+                    f"{self._host}/api/v1/auth/web/session", headers=headers, timeout=DEFAULT_NETWORK_TIMEOUT
+                )
             else:
                 r = self._post_session(self._subject_id)
             r.raise_for_status()
             self._session_expires_at = time.time() + SESSION_REFRESH_INTERVAL
         return self._websession.request(
-            method=method, url=f"{self._host}{url_path}", data=payload, timeout=DEFAULT_NETWORK_TIMEOUT
+            method=method, url=f"{self._host}{url_path}", data=payload, headers=headers, timeout=DEFAULT_NETWORK_TIMEOUT
         )
 
     def _post_session(self, subject_id):

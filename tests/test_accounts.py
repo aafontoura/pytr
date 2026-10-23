@@ -74,8 +74,8 @@ class _Session:
     def get(self, url, headers=None, timeout=None):
         return self._record("GET", url, None, headers, timeout)
 
-    def request(self, method, url, data=None, timeout=None):
-        return self._record(method, url, data, None, timeout)
+    def request(self, method, url, data=None, headers=None, timeout=None):
+        return self._record(method, url, data, headers, timeout)
 
 
 class _Websocket:

@@ -15,6 +15,7 @@ import re
 import stat
 import sys
 import time
+import types
 from datetime import datetime
 from pathlib import Path
 
@@ -32,8 +33,6 @@ import pytr.api
 from pytr.dl import (
     DL,
     PathTraversalError,
-    UnexpectedDocumentHostError,
-    _build_document_url,
     _sanitize_component,
 )
 from pytr.security import (
@@ -223,15 +222,6 @@ def test_sanitize_component_neutralises_traversal():
     assert _sanitize_component(".") == "_"
     assert "/" not in _sanitize_component("a/b/c")
     assert "\\" not in _sanitize_component("a\\b")
-
-
-def test_build_document_url_rejects_foreign_host():
-    with pytest.raises(UnexpectedDocumentHostError):
-        _build_document_url("//evil.com/x.pdf")
-
-
-def test_build_document_url_accepts_tr_host():
-    assert _build_document_url("api/v1/doc.pdf") == "https://api.traderepublic.com/api/v1/doc.pdf"
 
 
 class _RecordingSession:
@@ -605,6 +595,9 @@ class _FakePollResponse:
         self._payload = payload
         self.text = text
 
+    def raise_for_status(self):
+        pass
+
     def json(self):
         if self._payload is None:
             raise ValueError("no json")
@@ -632,8 +625,8 @@ def _v2_api(post=None, get=None, waf_token=None):
 # --- headers, device identity, no ~/.pytr --------------------------------
 
 
-def test_v2_headers_present_on_post_and_every_poll():
-    """Step 8: the required headers ride on every v2 call, not just the POST."""
+def test_v2_headers_present_on_login_polls_and_account_reads():
+    """Step 8: the required headers ride on the login calls and the account reads, not just the POST."""
     seen = []
 
     def post(url, json=None, timeout=None, headers=None):
@@ -644,11 +637,17 @@ def test_v2_headers_present_on_post_and_every_poll():
         seen.append(headers or {})
         return _FakePollResponse(payload={"status": "CONFIRMED"})
 
+    def request(method, url, data=None, headers=None, timeout=None):
+        seen.append(headers or {})
+        return _FakePollResponse(payload={})
+
     tr = _v2_api(post=post, get=get)
+    tr._websession.request = request
     tr.initiate_weblogin()
     tr.await_web_login_approval(timeout_s=5, interval_s=0)
+    tr.settings()
 
-    assert len(seen) == 3  # POST + requiredAction probe + approval poll
+    assert len(seen) == 5  # POST, requiredAction probe, approval poll, session refresh, account read
     for h in seen:
         assert h.get("X-TR-Device-Info")
         assert h.get("X-TR-App-Version")
@@ -1270,3 +1269,67 @@ def test_unconfirmed_handshake_is_closed_and_not_kept(monkeypatch):
         asyncio.run(tr._get_ws())
     assert closed == [True]
     assert tr._ws is None
+
+
+# --------------------------------------------------------------------------
+# P-3 - Chromium sandbox on by default, off only behind the explicit opt-in
+# --------------------------------------------------------------------------
+
+
+def _fake_playwright(monkeypatch, launches):
+    class _Page:
+        def goto(self, url, **kwargs):
+            pass
+
+    class _Context:
+        def new_page(self):
+            return _Page()
+
+        def cookies(self):
+            return [{"name": "aws-waf-token", "value": "token-value"}]
+
+    class _Browser:
+        def new_context(self):
+            return _Context()
+
+        def close(self):
+            pass
+
+    class _Chromium:
+        def launch(self, **kwargs):
+            launches.append(kwargs)
+            return _Browser()
+
+    class _Playwright:
+        chromium = _Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = _Playwright
+    package = types.ModuleType("playwright")
+    package.sync_api = sync_api
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+
+def test_playwright_launch_keeps_the_chromium_sandbox_by_default(monkeypatch):
+    launches = []
+    _fake_playwright(monkeypatch, launches)
+    monkeypatch.delenv("PYTR_ALLOW_NO_SANDBOX", raising=False)
+    assert _api()._fetch_waf_token_playwright() == "token-value"
+    assert launches[0]["chromium_sandbox"] is True
+    assert "--no-sandbox" not in launches[0]["args"]
+
+
+def test_playwright_launch_drops_the_sandbox_only_behind_the_opt_in(monkeypatch):
+    launches = []
+    _fake_playwright(monkeypatch, launches)
+    monkeypatch.setenv("PYTR_ALLOW_NO_SANDBOX", "1")
+    assert _api()._fetch_waf_token_playwright() == "token-value"
+    assert launches[0]["chromium_sandbox"] is False
+    assert "--no-sandbox" in launches[0]["args"]

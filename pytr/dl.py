@@ -4,7 +4,7 @@ from concurrent.futures import Future, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 from pathvalidate import sanitize_filepath
 from requests import Response
@@ -24,10 +24,6 @@ class PathTraversalError(RuntimeError):
     """Raised when a document path would escape the configured output directory (P-2)."""
 
 
-class UnexpectedDocumentHostError(RuntimeError):
-    """Raised when a document URL does not resolve to the TR API host (P-2)."""
-
-
 def _sanitize_component(value: str) -> str:
     """Neutralise path separators and traversal components in a single path segment.
 
@@ -41,15 +37,6 @@ def _sanitize_component(value: str) -> str:
     if stripped in {".", ".."}:
         return "_"
     return value
-
-
-def _build_document_url(payload_path: str) -> str:
-    """Build a document URL from a server-supplied path, pinned to the TR host (P-2/L5)."""
-    url = urljoin("https://api.traderepublic.com/", payload_path)
-    netloc = urlparse(url).netloc
-    if netloc != _TR_API_HOST:
-        raise UnexpectedDocumentHostError(f"Refusing document URL with unexpected host: {netloc!r}")
-    return url
 
 
 def _is_tr_document_url(url: str) -> bool:
@@ -417,10 +404,7 @@ class DL:
         send asynchronous request, append future with filepath to self.futures
         """
         doc_url = doc["action"]["payload"]
-        if isinstance(doc_url, dict):
-            # P-2/L5: urljoin + netloc pin instead of raw string concatenation.
-            doc_url = _build_document_url(doc_url["path"])
-        elif not _is_tr_document_url(doc_url):
+        if not _is_tr_document_url(doc_url):
             self.log.warning(f"Skipping document with unexpected URL host: {urlparse(doc_url).netloc!r}")
             return
 
