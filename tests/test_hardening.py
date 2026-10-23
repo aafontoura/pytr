@@ -299,3 +299,102 @@ def test_read_only_defaults_false():
     assert tr._read_only is False
     # guard is a no-op when not read-only
     assert tr._guard_read_only() is None
+
+
+# --------------------------------------------------------------------------
+# P-7 - the PIN is single-use and released after the login POST (AC-P7.1)
+# --------------------------------------------------------------------------
+
+PIN = "4711"
+
+
+class _FakeLoginResponse:
+    status_code = 200
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"processId": "proc-1", "countdownInSeconds": 30}
+
+
+def _login_api(post):
+    """Build an API with no WAF fetch and a stubbed login POST (no network I/O)."""
+    tr = pytr.api.TradeRepublicApi(phone_no="+490000000000", pin=PIN, waf_token=None, read_only=True)
+    tr._websession.post = post
+    return tr
+
+
+def test_pin_is_sent_once_then_released():
+    """AC-P7.1: the login POST carries the PIN, and the reference is dropped after."""
+    sent = []
+
+    def post(url, json=None, timeout=None, headers=None):
+        sent.append(json)
+        return _FakeLoginResponse()
+
+    tr = _login_api(post)
+    assert tr.pin == PIN  # held until consumed
+
+    countdown = tr.initiate_weblogin()
+
+    assert countdown == 31
+    assert sent == [{"phoneNumber": "+490000000000", "pin": PIN}]  # actually delivered
+    assert tr.pin is None  # released immediately after the POST
+
+
+def test_pin_released_even_when_login_post_raises():
+    """A network failure must not leave the PIN resident on the client."""
+
+    def post(url, json=None, timeout=None, headers=None):
+        raise ConnectionError("network down")
+
+    tr = _login_api(post)
+    with pytest.raises(ConnectionError):
+        tr.initiate_weblogin()
+    assert tr.pin is None
+
+
+def test_no_attribute_retains_the_pin_after_login():
+    """After login, no attribute of the client object holds the PIN value."""
+    tr = _login_api(lambda url, json=None, timeout=None, headers=None: _FakeLoginResponse())
+    tr.initiate_weblogin()
+
+    leaks = [name for name, value in vars(tr).items() if value == PIN]
+    assert leaks == [], f"PIN retained on attributes: {leaks}"
+
+
+def test_second_initiate_weblogin_without_pin_raises():
+    """Re-login on a consumed client fails loudly instead of POSTing a null pin."""
+    calls = []
+
+    def post(url, json=None, timeout=None, headers=None):
+        calls.append(json)
+        return _FakeLoginResponse()
+
+    tr = _login_api(post)
+    tr.initiate_weblogin()
+
+    with pytest.raises(ValueError, match="PIN already consumed"):
+        tr.initiate_weblogin()
+
+    # The failed re-login must not have reached the network at all.
+    assert len(calls) == 1
+
+
+def test_resend_and_complete_weblogin_do_not_need_the_pin():
+    """The rest of the login flow works off _process_id, not the PIN (P-7 safety)."""
+    posted = []
+
+    def post(url, json=None, timeout=None, headers=None):
+        posted.append(url)
+        return _FakeLoginResponse()
+
+    tr = _login_api(post)
+    tr.initiate_weblogin()
+    assert tr.pin is None
+
+    tr.resend_weblogin()  # must not raise
+    tr.complete_weblogin("123456")  # must not raise
+    assert any("/resend" in u for u in posted)
+    assert any(u.endswith("/123456") for u in posted)
