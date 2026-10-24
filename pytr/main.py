@@ -12,7 +12,7 @@ from pathlib import Path
 
 import shtab
 
-from pytr.account import login
+from pytr.account import login, print_accounts
 from pytr.alarms import Alarms
 from pytr.details import Details
 from pytr.dl import DL
@@ -20,6 +20,7 @@ from pytr.event import Event
 from pytr.portfolio import PORTFOLIO_COLUMNS, Portfolio
 from pytr.rates import RATE_COLUMNS, Rates, parse_isin_input
 from pytr.savings_plans import SavingsPlans
+from pytr.security import InsecurePathError
 from pytr.timeline import Timeline
 from pytr.transactions import SUPPORTED_LANGUAGES, TransactionExporter
 from pytr.utils import check_version, get_logger
@@ -80,14 +81,48 @@ def get_main_parser():
     parser_login_args = argparse.ArgumentParser(add_help=False)
     parser_login_args.add_argument("-n", "--phone_no", help="TradeRepublic phone number (international format)")
     parser_login_args.add_argument("-p", "--pin", help="TradeRepublic pin")
-    parser_login_args.add_argument(
+    waf_group = parser_login_args.add_mutually_exclusive_group()
+    waf_group.add_argument(
         "--waf-token",
-        help='AWS WAF token value or the method to obtain it. Values: "playwright", "awswaf" or a token string, e.g. an aws-waf-token cookie captured from a browser session.',
-        default="playwright",
+        help=(
+            "AWS WAF token string or the method to obtain it. Possible values: "
+            "\"playwright\" (to use playwright to obtain a token, needs the optional extra: pip install 'pytr[playwright]' && playwright install chromium), "
+            '"awswaf" (to use a pure Python implementation to obtain a token, no browser), '
+            '"default" (let pytr determine what to do, e.g. by login method used.), '
+            "or a token string, e.g. captured from a browser session."
+        ),
+        default="default",
+        dest="waf_token",
+    )
+    waf_group.add_argument(
+        "--no-waf-token",
+        help="Skip the AWS WAF token entirely.",
+        action="store_const",
+        const=None,
+        dest="waf_token",
+    )
+    parser_login_args.add_argument(
+        "--account",
+        help=(
+            "Use another account of this login, e.g. a company account. Give its type "
+            '(e.g. "LEGAL_ENTITY"), name or customer id as listed by "pytr accounts". '
+            "Defaults to your own account."
+        ),
+        default=None,
     )
     parser_login_args.add_argument(
         "--store_credentials",
         help="Store credentials (Phone number, pin, cookies) for next usage",
+        action="store_true",
+        default=False,
+    )
+    parser_login_args.add_argument(
+        "--v2",
+        help=(
+            "Use the v2 web-login flow: confirm in the Trade Republic mobile app "
+            "instead of entering an SMS/notification code. "
+            "Accounts secured with an authenticator app are not supported."
+        ),
         action="store_true",
         default=False,
     )
@@ -136,6 +171,16 @@ def get_main_parser():
     )
     parser_cmd.add_parser(
         "login",
+        formatter_class=formatter,
+        parents=[parser_login_args],
+        help=info,
+        description=info,
+    )
+
+    # accounts
+    info = "List accounts of this login, e.g. a company accounts or child accounts. Use them with --account"
+    parser_cmd.add_parser(
+        "accounts",
         formatter_class=formatter,
         parents=[parser_login_args],
         help=info,
@@ -317,6 +362,19 @@ def get_main_parser():
         help="Do not sort documents into folders and keep their original filenames",
         action="store_true",
     )
+    parser_dl_docs.add_argument(
+        "--load-event-database",
+        help="Debug/analysis option: load events from this all_events.json instead of fetching from TR. Implies --dry-run; document URLs in the database may be expired.",
+        metavar="PATH",
+        default=None,
+        type=Path,
+    )
+    parser_dl_docs.add_argument(
+        "--dry-run",
+        default=False,
+        help="Create folder structure and empty placeholder files without downloading",
+        action="store_true",
+    )
 
     # export_transactions
     info = (
@@ -343,11 +401,25 @@ def get_main_parser():
         type=int,
     )
     parser_export_transactions.add_argument(
+        "--from_timestamp",
+        help="Include data from this exact timestamp onwards; overrides --last_days. Local time if no offset given (e.g. 2026-10-01T07:30:00), or with UTC offset (e.g. 2026-10-01T05:30:00+00:00)",
+        metavar="TIMESTAMP",
+        default=None,
+        type=str,
+    )
+    parser_export_transactions.add_argument(
         "--days_until",
         help="Include data up to N days ago (0 = include all days)",
         metavar="DAYS",
         default=0,
         type=int,
+    )
+    parser_export_transactions.add_argument(
+        "--until_timestamp",
+        help="Include data up to this exact timestamp; overrides --days_until. Local time if no offset given (e.g. 2026-10-01T07:30:00), or with UTC offset (e.g. 2026-10-01T05:30:00+00:00)",
+        metavar="TIMESTAMP",
+        default=None,
+        type=str,
     )
     parser_export_transactions.add_argument(
         "--store-event-database",
@@ -366,6 +438,13 @@ def get_main_parser():
         default=False,
         help="Dump more raw data in json format",
         action=argparse.BooleanOptionalAction,
+    )
+    parser_export_transactions.add_argument(
+        "--load-event-database",
+        help="Load events from this all_events.json file instead of fetching from TR (implies no login)",
+        metavar="PATH",
+        type=Path,
+        default=None,
     )
     parser_export_transactions.add_argument(
         "--export-format",
@@ -481,6 +560,15 @@ def exit_gracefully(signum, frame):
 
 
 def main():
+    try:
+        _main()
+    except InsecurePathError as e:
+        # P-1: a refused credentials, cookie or debug-log path is a fatal user error, not a crash.
+        get_logger(__name__).fatal(str(e))
+        sys.exit(1)
+
+
+def _main():
     # store the original SIGINT handler
     global original_sigint
     original_sigint = signal.getsignal(signal.SIGINT)
@@ -496,7 +584,9 @@ def main():
 
     # Compute the timestamp range to get data for
     not_before = 0
-    if hasattr(args, "last_days"):
+    if hasattr(args, "from_timestamp") and args.from_timestamp is not None:
+        not_before = datetime.fromisoformat(args.from_timestamp).astimezone().timestamp()
+    elif hasattr(args, "last_days"):
         if args.last_days < 0:
             not_before = float(-1)
         elif args.last_days == 0:
@@ -504,9 +594,13 @@ def main():
         else:
             not_before = (datetime.now().astimezone() - timedelta(days=args.last_days)).timestamp()
     not_after = (
-        (datetime.now().astimezone() - timedelta(days=args.days_until)).timestamp()
-        if hasattr(args, "days_until") and args.days_until > 0
-        else float("inf")
+        datetime.fromisoformat(args.until_timestamp).astimezone().timestamp()
+        if hasattr(args, "until_timestamp") and args.until_timestamp is not None
+        else (
+            (datetime.now().astimezone() - timedelta(days=args.days_until)).timestamp()
+            if hasattr(args, "days_until") and args.days_until > 0
+            else float("inf")
+        )
     )
 
     if args.command == "login":
@@ -515,6 +609,21 @@ def main():
             pin=args.pin,
             store_credentials=args.store_credentials,
             waf_token=args.waf_token,
+            v2=args.v2,
+            account=args.account,
+        )
+    elif args.command == "accounts":
+        print(
+            print_accounts(
+                login(
+                    phone_no=args.phone_no,
+                    pin=args.pin,
+                    store_credentials=args.store_credentials,
+                    waf_token=args.waf_token,
+                    v2=args.v2,
+                    account=args.account,
+                )
+            )
         )
     elif args.command == "portfolio":
         Portfolio(
@@ -523,6 +632,8 @@ def main():
                 pin=args.pin,
                 store_credentials=args.store_credentials,
                 waf_token=args.waf_token,
+                v2=args.v2,
+                account=args.account,
             ),
             args.include_watchlist,
             instruments_to_ignore=re.split(r"[,;]", args.ignore) if args.ignore else [],
@@ -543,6 +654,8 @@ def main():
                 pin=args.pin,
                 store_credentials=args.store_credentials,
                 waf_token=args.waf_token,
+                v2=args.v2,
+                account=args.account,
             ),
             isins,
             output=args.output,
@@ -558,16 +671,22 @@ def main():
                 pin=args.pin,
                 store_credentials=args.store_credentials,
                 waf_token=args.waf_token,
+                v2=args.v2,
+                account=args.account,
             ),
             args.isin,
         ).get()
     elif args.command == "dl_docs":
         DL(
-            login(
+            None
+            if args.load_event_database is not None
+            else login(
                 phone_no=args.phone_no,
                 pin=args.pin,
                 store_credentials=args.store_credentials,
                 waf_token=args.waf_token,
+                v2=args.v2,
+                account=args.account,
             ),
             args.output,
             args.format,
@@ -585,6 +704,8 @@ def main():
             sort_export=args.sort,
             format_export=args.export_format,
             flat=args.flat,
+            load_event_database=args.load_event_database,
+            dry_run=args.dry_run,
         ).do_dl()
     elif args.command == "export_transactions":
         if args.outputfile is None and args.outputdir is None:
@@ -592,11 +713,15 @@ def main():
             return -1
 
         tl = Timeline(
-            login(
+            None
+            if not_before == -1 or args.load_event_database is not None
+            else login(
                 phone_no=args.phone_no,
                 pin=args.pin,
                 store_credentials=args.store_credentials,
                 waf_token=args.waf_token,
+                v2=args.v2,
+                account=args.account,
             ),
             args.outputdir,
             not_before,
@@ -604,6 +729,7 @@ def main():
             args.store_event_database,
             args.scan_for_duplicates,
             args.dump_raw_data,
+            load_event_database=args.load_event_database,
         )
         asyncio.run(tl.tl_loop())
         events = tl.events
@@ -631,6 +757,8 @@ def main():
                     pin=args.pin,
                     store_credentials=args.store_credentials,
                     waf_token=args.waf_token,
+                    v2=args.v2,
+                    account=args.account,
                 ),
                 args.input,
                 args.outputfile,
@@ -646,6 +774,8 @@ def main():
                     pin=args.pin,
                     store_credentials=args.store_credentials,
                     waf_token=args.waf_token,
+                    v2=args.v2,
+                    account=args.account,
                 ),
                 args.input,
                 args.inputfile,
@@ -661,6 +791,8 @@ def main():
                 pin=args.pin,
                 store_credentials=args.store_credentials,
                 waf_token=args.waf_token,
+                v2=args.v2,
+                account=args.account,
             ),
             args.outputfile,
             decimal_localization=args.decimal_localization,

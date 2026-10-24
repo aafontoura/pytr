@@ -31,13 +31,13 @@ jobs:
       - name: Pytest
         run: uv run pytest
       - name: Ruff check
-        run: uv run ruff check
+        run: uvx ruff@0.9.6 check
       - name: Ruff format
-        run: uv run ruff format --check --diff
+        run: uvx ruff@0.9.6 format --check --diff
       - name: Mypy type check
         run: uv run mypy .
       - name: Check if README.md automatically generated content is up to date
-        run: diff -u <(cat README.md | sed -z '$s/\n*$//') <(uvx mksync@0.1.5 README.md | sed -z '$s/\n*$//')
+        run: diff -u <(printf '%s\n' "$(cat README.md)") <(printf '%s\n' "$(uvx mksync@0.1.5 README.md)")
 
   build-n-publish:
     name: Build and publish Python distributions to PyPI

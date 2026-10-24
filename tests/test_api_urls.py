@@ -1,0 +1,365 @@
+"""Pin the web login endpoints, their required headers and the login process state machine."""
+
+import base64
+import importlib
+import json as jsonlib
+import re
+from typing import Any
+
+import pytest
+import requests
+
+import pytr.api
+from pytr.api import (
+    APP_VERSION,
+    ENV_APP_VERSION,
+    ENV_PLATFORM,
+    ENV_USER_AGENT,
+    USER_AGENT,
+    WEB_PLATFORM,
+    AuthenticatorRequiredError,
+    TradeRepublicApi,
+)
+
+LOGIN = "https://api.traderepublic.com/api/v2/auth/web/login"
+PROCESS = "https://api.traderepublic.com/api/v2/auth/web/login/processes/pid-1"
+
+
+def _error(code: str) -> dict[str, Any]:
+    return {"errors": [{"errorCode": code, "errorMessage": None, "meta": None}]}
+
+
+class _Response:
+    def __init__(self, url: str, payload: Any = None, status_code: int = 200):
+        self.url = url
+        self.status_code = status_code
+        self._payload = {} if payload is None else payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            # Mirrors requests: the message carries the URL, and with it the process id.
+            raise requests.HTTPError(f"{self.status_code} Client Error for url: {self.url}")
+
+    def json(self) -> Any:
+        return self._payload
+
+
+class _Session:
+    """Records requests instead of sending them. Replies come from a queue."""
+
+    def __init__(self, replies: list[Any]):
+        self.calls: list[dict[str, Any]] = []
+        self._replies = list(replies)
+        self.cookies = None
+        self.headers = dict(TradeRepublicApi._default_headers)
+
+    def _record(self, method: str, url: str, json: Any = None, headers: Any = None, timeout: Any = None) -> _Response:
+        self.calls.append({"method": method, "url": url, "json": json, "headers": headers or {}, "timeout": timeout})
+        reply = self._replies.pop(0) if self._replies else {}
+        status, payload = reply if isinstance(reply, tuple) else (200, reply)
+        return _Response(url, payload, status)
+
+    def post(self, url, json=None, headers=None, timeout=None, **kwargs):
+        return self._record("POST", url, json, headers, timeout)
+
+    def get(self, url, headers=None, timeout=None):
+        return self._record("GET", url, None, headers, timeout)
+
+    def request(self, method, url, data=None, headers=None, timeout=None):
+        return self._record(method, url, None, headers, timeout)
+
+
+def _api(replies):
+    tr = TradeRepublicApi(phone_no="+490000000000", pin="0000", waf_token=None, use_v2_login=True)
+    tr._websession = _Session(replies)
+    return tr
+
+
+def _urls(tr):
+    return [c["url"] for c in tr._websession.calls]
+
+
+# --- initiate_weblogin ---------------------------------------------------------------
+
+
+def test_initiate_weblogin_uses_v2():
+    tr = _api([{"processId": "pid-1", "countdownInSeconds": 60}, {"status": "PENDING"}])
+
+    countdown = tr.initiate_weblogin()
+
+    assert tr._websession.calls[0]["url"] == LOGIN
+    assert tr._websession.calls[0]["json"] == {"phoneNumber": "+490000000000", "pin": "0000"}
+    assert tr._process_id == "pid-1"
+    assert countdown == 61
+
+
+def test_initiate_weblogin_without_countdown_defaults_to_120():
+    tr = _api([{"processId": "pid-1"}, {"status": "PENDING"}])
+
+    assert tr.initiate_weblogin() == 121
+
+
+def test_initiate_weblogin_reads_required_action_from_the_process():
+    """The second factor sits on the login process, not in the login response."""
+    tr = _api([{"processId": "pid-1"}, {"requiredAction": "AUTHENTICATOR_VERIFICATION"}])
+
+    tr.initiate_weblogin()
+
+    assert _urls(tr)[1] == PROCESS
+    assert tr.weblogin_needs_authenticator is True
+
+
+def test_initiate_weblogin_falls_back_to_in_app_when_process_unreadable():
+    tr = _api([{"processId": "pid-1"}, (500, _error("UNKNOWN_ERROR"))])
+
+    tr.initiate_weblogin()
+
+    assert tr.weblogin_needs_authenticator is False
+
+
+def test_initiate_weblogin_rejects_a_null_process_id():
+    tr = _api([{"processId": None}])
+
+    with pytest.raises(ValueError, match="without a confirmation step"):
+        tr.initiate_weblogin()
+
+
+# --- complete_weblogin ---------------------------------------------------------------
+
+
+def test_complete_weblogin_refuses_authenticator_accounts():
+    """D-C: authenticator (TOTP) accounts are a distinct stage error - this flow
+    is fixed at push approval with no second secret, so it must fail instead of
+    sending (or waiting for) a code that can never arrive."""
+    tr = _api([])
+    tr._process_id = "pid-1"
+    tr._required_action = "AUTHENTICATOR_VERIFICATION"
+
+    with pytest.raises(AuthenticatorRequiredError, match="authenticator app"):
+        tr.complete_weblogin("123456")
+
+    assert tr._websession.calls == []
+
+
+def test_await_approval_refuses_authenticator_accounts_before_polling():
+    tr = _api([])
+    tr._process_id = "pid-1"
+    tr._required_action = "AUTHENTICATOR_VERIFICATION"
+
+    with pytest.raises(AuthenticatorRequiredError, match="not supported"):
+        tr.await_web_login_approval(timeout_s=5, interval_s=0)
+
+    assert tr._websession.calls == []
+
+
+def test_complete_weblogin_empty_code_saves_without_requests():
+    """P-8.1: the v2 flow splits initiate / await / complete; complete_weblogin("")
+    is the post-poll session save and issues no request."""
+    tr = _api([])
+    tr._process_id = "pid-1"
+
+    tr.complete_weblogin("")
+
+    assert tr._websession.calls == []
+
+
+# --- login process state machine -----------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["CONFIRMED", "COMPLETED"])
+def test_poll_accepts_both_terminal_states(status):
+    tr = _api([{"status": status}])
+    tr._process_id = "pid-1"
+
+    tr._await_weblogin_confirmation(interval=0)
+
+
+def test_poll_reports_a_rejected_login():
+    tr = _api([(410, _error("ALREADY_PROCESSED"))])
+    tr._process_id = "pid-1"
+
+    with pytest.raises(ValueError, match="rejected"):
+        tr._await_weblogin_confirmation(interval=0)
+
+
+def test_poll_reports_an_expired_login():
+    tr = _api([(410, _error("PROCESS_GONE"))])
+    tr._process_id = "pid-1"
+
+    with pytest.raises(ValueError, match="expired"):
+        tr._await_weblogin_confirmation(interval=0)
+
+
+def test_poll_times_out_at_the_server_side_expiry():
+    tr = _api([{"status": "PENDING", "expiresAt": "2020-01-01T00:00:00Z"}])
+    tr._process_id = "pid-1"
+
+    with pytest.raises(TimeoutError):
+        tr._await_weblogin_confirmation(interval=0)
+
+
+def test_deadline_prefers_expires_at_over_the_fallback():
+    tr = _api([])
+
+    assert tr._weblogin_deadline({"expiresAt": "2999-01-01T00:00:00Z"}) > tr._weblogin_deadline({}) + 60
+
+
+def test_login_errors_do_not_leak_the_process_id():
+    """raise_for_status() would put the URL, and with it the process id, into the message."""
+    tr = _api([(410, _error("PROCESS_GONE"))])
+    tr._process_id = "pid-1"
+
+    with pytest.raises(ValueError) as excinfo:
+        tr._await_weblogin_confirmation(interval=0)
+
+    assert "pid-1" not in str(excinfo.value)
+    assert "http" not in str(excinfo.value)
+
+
+def test_resend_weblogin_warns_instead_of_calling_a_removed_endpoint():
+    tr = _api([])
+
+    tr.resend_weblogin()
+
+    assert tr._websession.calls == []
+
+
+# --- required headers ----------------------------------------------------------------
+
+REQUIRED_HEADERS = ("X-TR-Device-Info", "X-TR-App-Version", "X-Tr-Platform")
+
+
+def _every_login_call():
+    """Every v2 login call pytr makes: start, probe, and each approval poll."""
+    tr = _api([{"processId": "pid-1"}, {"status": "PENDING"}, {"status": "CONFIRMED"}])
+    tr.initiate_weblogin()
+    tr.await_web_login_approval(timeout_s=5, interval_s=0)
+
+    return tr._websession.calls
+
+
+def test_every_v2_login_call_sends_the_required_headers():
+    """Without them Trade Republic answers 400 MISSING_REQUIRED_HEADER."""
+    calls = _every_login_call()
+
+    assert [c["url"] for c in calls] == [LOGIN, PROCESS, PROCESS]
+    for call in calls:
+        for header in REQUIRED_HEADERS:
+            assert call["headers"].get(header), f"{header} missing on {call['method']} {call['url']}"
+
+
+def test_device_info_is_base64_encoded_json():
+    device = jsonlib.loads(base64.b64decode(_api([])._login_headers()["X-TR-Device-Info"]))
+
+    # The frontend hashes a canvas fingerprint with SHA-512; same length, same alphabet.
+    assert re.fullmatch(r"[0-9a-f]{128}", device["stableDeviceId"])
+    assert device["browser"] == "Chrome"
+    # Taken from the User-Agent, so the two cannot drift apart.
+    assert device["browserVersion"] in TradeRepublicApi._default_headers["User-Agent"]
+
+
+def test_device_info_is_the_same_for_every_login():
+    """The frontend builds it once per page load; ours must not wander between runs."""
+    assert _api([])._login_headers()["X-TR-Device-Info"] == _api([])._login_headers()["X-TR-Device-Info"]
+
+
+def test_app_version_and_platform_come_from_the_web_frontend():
+    headers = _api([])._login_headers()
+
+    # A build version of the frontend, not a pytr version.
+    assert re.fullmatch(r"\d+\.\d+\.\d+", headers["X-TR-App-Version"])
+    assert headers["X-Tr-Platform"] == "web-pro"
+
+
+# --- environment overrides -----------------------------------------------------------
+
+CHROME_149 = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+
+
+FIREFOX_128 = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+
+@pytest.fixture
+def reimported_with(monkeypatch):
+    """pytr.api re-imported under a patched environment.
+
+    X-TR-App-Version and X-Tr-Platform are read per call, so those overrides need
+    nothing special. The User-Agent is baked into _default_headers when the class
+    body runs, so seeing a different one means importing the module again.
+    """
+
+    def _load(**environment):
+        for name, value in environment.items():
+            monkeypatch.setenv(name, value)
+        return importlib.reload(pytr.api)
+
+    yield _load
+    monkeypatch.undo()
+    importlib.reload(pytr.api)
+
+
+def _api_of(module):
+    return module.TradeRepublicApi(phone_no="+490000000000", pin="0000", waf_token=None, use_v2_login=True)
+
+
+def _device_info_of(module):
+    return jsonlib.loads(base64.b64decode(_api_of(module)._login_headers()["X-TR-Device-Info"]))
+
+
+def test_app_version_can_be_overridden_from_the_environment(monkeypatch):
+    """A frontend release makes the built-in stale; 426 must be fixable without a release."""
+    monkeypatch.setenv(ENV_APP_VERSION, "2.9999.1")
+
+    assert _api([])._login_headers()["X-TR-App-Version"] == "2.9999.1"
+
+
+def test_platform_can_be_overridden_from_the_environment(monkeypatch):
+    monkeypatch.setenv(ENV_PLATFORM, "web")
+
+    assert _api([])._login_headers()["X-Tr-Platform"] == "web"
+
+
+def test_user_agent_can_be_overridden_from_the_environment(reimported_with):
+    module = reimported_with(**{ENV_USER_AGENT: CHROME_149})
+
+    assert module.TradeRepublicApi._default_headers["User-Agent"] == CHROME_149
+    assert _api_of(module)._websession.headers["User-Agent"] == CHROME_149
+
+
+def test_an_empty_override_keeps_the_built_in_default(monkeypatch, reimported_with):
+    """An empty assignment must not send an empty header for any of the three."""
+    monkeypatch.setenv(ENV_APP_VERSION, "")
+    monkeypatch.setenv(ENV_PLATFORM, "")
+
+    headers = _api([])._login_headers()
+    assert headers["X-TR-App-Version"] == APP_VERSION
+    assert headers["X-Tr-Platform"] == WEB_PLATFORM
+
+    module = reimported_with(**{ENV_USER_AGENT: ""})
+    assert module.TradeRepublicApi._default_headers["User-Agent"] == USER_AGENT
+
+
+def test_device_info_follows_the_overridden_user_agent(reimported_with):
+    """browserVersion is scraped from the User-Agent; the two must not drift apart."""
+    assert _device_info_of(reimported_with(**{ENV_USER_AGENT: CHROME_149}))["browserVersion"] == "149.0.0.0"
+
+
+def test_a_non_chrome_user_agent_leaves_the_browser_version_empty(reimported_with):
+    """The frontend omits what the browser does not provide, and TR accepts that."""
+    assert _device_info_of(reimported_with(**{ENV_USER_AGENT: FIREFOX_128}))["browserVersion"] == ""
+
+
+# --- endpoints that must NOT move ----------------------------------------------------
+
+
+def test_settings_stays_on_v2_account_and_v1_session():
+    """Neither endpoint was part of the v1 login removal."""
+    tr = _api([{}, {}])
+    tr._session_expires_at = 0
+
+    tr.settings()
+
+    assert _urls(tr) == [
+        "https://api.traderepublic.com/api/v1/auth/web/session",
+        "https://api.traderepublic.com/api/v2/auth/account",
+    ]

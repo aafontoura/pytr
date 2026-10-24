@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 
 from .api import TradeRepublicError
-from .utils import get_logger, preview
+from .utils import get_logger
 
 MAX_EVENT_REQUEST_BATCH = 1000
 
@@ -43,15 +43,16 @@ class Timeline:
         scan_for_duplicates=False,
         dump_raw_data=False,
         event_callback=lambda *a, **kw: None,
+        load_event_database=None,
     ):
         self.tr = tr
         self.output_path = output_path
-        if not_before == -1:
+        if load_event_database is not None or not_before == -1:
             self.fetch_from_tr = False
-            self.not_before = float(0)
         else:
             self.fetch_from_tr = True
-            self.not_before = not_before
+        self.not_before = float(0) if not_before == -1 else not_before
+        self.load_event_database = load_event_database
         self.not_after = not_after
         self.store_event_database = store_event_database
         self.scan_for_duplicates = scan_for_duplicates
@@ -74,11 +75,11 @@ class Timeline:
         output_path.mkdir(parents=True, exist_ok=True)
 
     async def tl_loop(self):
-        await self.get_next_timeline_transactions(None)
-
-        # We might not want to download anything from TR but just create/update account_transactions.csv from available data
         if not self.fetch_from_tr:
             self.finish_timeline_details()
+            return
+
+        await self.get_next_timeline_transactions(None)
 
         while not self.dl_done:
             try:
@@ -107,7 +108,7 @@ class Timeline:
             elif subscription.get("type", "") == "timelineDetailV2":
                 await self.process_timelineDetail(response, subscription.get("id"))
             else:
-                self.log.warning(f"unmatched subscription of type '{subscription['type']}':\n{preview(response)}")
+                self.log.warning(f"unmatched subscription of type '{subscription['type']}'")
 
         await self.tr.close()
 
@@ -124,7 +125,7 @@ class Timeline:
             self.num_timelines += 1
             added_last_event = False
             for event in response["items"]:
-                event_timestamp = datetime.fromisoformat(event["timestamp"][:19]).timestamp()
+                event_timestamp = datetime.fromisoformat(event["timestamp"][:19] + "+00:00").timestamp()
                 if event_timestamp > self.not_before:
                     if event_timestamp < self.not_after:
                         event["source"] = "timelineTransaction"
@@ -160,7 +161,7 @@ class Timeline:
             self.num_timelines += 1
             added_last_event = False
             for event in response["items"]:
-                event_timestamp = datetime.fromisoformat(event["timestamp"][:19]).timestamp()
+                event_timestamp = datetime.fromisoformat(event["timestamp"][:19] + "+00:00").timestamp()
                 if event_timestamp > self.not_before:
                     if event_timestamp < self.not_after:
                         event["source"] = "timelineActivity"
@@ -201,27 +202,29 @@ class Timeline:
         self.detail_digits = len(str(self.all_detail))
 
         for event in self.timeline_details.values():
-            msg = None
-            action = event.get("action")
-            if action is None:
-                if event.get("actionLabel") is None:
-                    msg = "Skip timeline detail: No action/actionLabel section"
-            elif action.get("type") != "timelineDetail":
-                msg = f"Skip timeline detail: Action type {action['type']} is not timelineDetail"
-            elif action.get("payload") != event["id"]:
-                msg = f"Skip timeline detail: Action payload {action['payload']} does not match id {event['id']}"
-
             self.requested_detail += 1
-            if msg is None:
-                await self.tr.timeline_detail_v2(event["id"])
-            else:
+
+            action = event.get("action")
+            action_type = action.get("type") if action is not None else None
+            if action_type != "timelineDetail":
+                self.received_detail += 1
+                self.events.append(event)
+                self.log.info(
+                    f"{self.received_detail + self.skipped_detail:>{self.detail_digits}}/{self.all_detail}: "
+                    f"{event['title']} -- {event['subtitle']} - {event['timestamp'][:19]}"
+                    f" (no timeline detail, action type: {action_type!r})"
+                )
+            elif action.get("payload") != event["id"]:
                 self.received_detail += 1
                 self.events.append(event)
                 self.log.warning(
                     f"{self.received_detail + self.skipped_detail:>{self.detail_digits}}/{self.all_detail}: "
-                    + f"{event['title']} -- {event['subtitle']} - {event['timestamp'][:19]} {msg}"
+                    f"{event['title']} -- {event['subtitle']} - {event['timestamp'][:19]}"
+                    f" (action payload {action['payload']!r} does not match event id {event['id']!r})"
                 )
-                self.log.debug("%s: %s", msg, json.dumps(event, indent=2))
+                self.log.debug("payload mismatch (event id=%s)", event.get("id", "?"))
+            else:
+                await self.tr.timeline_detail_v2(event["id"])
 
             if self.requested_detail % MAX_EVENT_REQUEST_BATCH == 0 and (
                 (self.received_detail + self.skipped_detail) < self.requested_detail
@@ -249,7 +252,8 @@ class Timeline:
         event = self.timeline_details.get(subscription_id)
 
         if event is None:
-            self.log.warning(f"Ignoring unrequested event response {json.dumps(response, indent=2)}")
+            # P-4: do not dump the unrequested response (it is a full event payload).
+            self.log.warning("Ignoring unrequested event response for subscription %s", subscription_id)
             self.skipped_detail += 1
             self.finish_if_done()
             return
@@ -281,22 +285,31 @@ class Timeline:
         else:
             self.log.info("Skip fetching data from TR.")
 
-        if self.store_event_database:
-            self.log.info("Updating event database...")
-
-            # read old events from all_events.json
+        if self.store_event_database or self.load_event_database is not None:
+            # read old events from all_events.json (or explicit --load-event-database path)
             old_events = []
-            all_events_path = self.output_path / "all_events.json"
+            all_events_path = (
+                self.load_event_database
+                if self.load_event_database is not None
+                else self.output_path / "all_events.json"
+            )
             if all_events_path.exists():
-                self.log.info("Reading event database...")
+                self.log.info(f"Loading event database from {all_events_path}...")
                 with open(all_events_path, "r", encoding="utf-8") as f:
-                    old_events = json.load(f)
+                    try:
+                        old_events = json.load(f)
+                    except json.JSONDecodeError:
+                        self.log.warning(f"Event database file is empty or invalid: {all_events_path}")
+                if not old_events:
+                    self.log.warning("No events found in event database.")
+            elif self.load_event_database is not None:
+                self.log.warning(f"Event database file not found: {all_events_path}")
 
             # if we have new data from a certain period, throw out old data
             if self.fetch_from_tr and (self.not_before != 0 or self.not_after != float("inf")):
                 self.log.info("Throwing away outdated events...")
                 for i in range(len(old_events) - 1, -1, -1):
-                    ts = datetime.fromisoformat(old_events[i]["timestamp"][:19]).timestamp()
+                    ts = datetime.fromisoformat(old_events[i]["timestamp"][:19] + "+00:00").timestamp()
                     if ts > self.not_before and ts < self.not_after:
                         del old_events[i]
 
@@ -353,11 +366,24 @@ class Timeline:
             self.log.info("Sorting events...")
             self.events.sort(key=lambda value: datetime.fromisoformat(value["timestamp"][:19]))
 
-            if self.fetch_from_tr:
+            if self.fetch_from_tr and self.store_event_database:
                 self.log.info(f"Writing {all_events_path}...")
                 with open(all_events_path, "w", encoding="utf-8") as f:
                     json.dump(self.events, f, ensure_ascii=False, indent=2, default=str)
+                self.log.info("Updated event database.")
 
-            self.log.info("Updated event database.")
+        if not self.fetch_from_tr:
+            filtered = [
+                e
+                for e in self.events
+                if "details" in e
+                and datetime.fromisoformat(e["timestamp"][:19] + "+00:00").timestamp() >= self.not_before
+                and datetime.fromisoformat(e["timestamp"][:19] + "+00:00").timestamp() <= self.not_after
+            ]
+            self.log.info(f"Replaying {len(filtered)} events from database (out of {len(self.events)} total)...")
+            self.all_detail = len(filtered)
+            for event in filtered:
+                self.event_callback(event)
+            self.events = filtered
 
         self.dl_done = True
